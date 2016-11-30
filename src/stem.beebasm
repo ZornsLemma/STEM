@@ -1,0 +1,102 @@
+\ stem.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Top level BeebAsm source file; this includes all the other source files in an
+\ appropriate order and adds the generated ROM image to the SSD along with
+\ supporting files.
+
+\ The source code is split up across a number of files which are included
+\ here. These generally wrap their entire contents in a single scope, so
+\ symbols are effectively private to their file by default. Symbols which
+\ are explicitly "exported" to other files are made global with '.*label'.
+\
+\ Individual subroutines or groups of related subroutines are sometimes
+\ enclosed within a scope of their own (nested inside the file scope). Within
+\ these nested scopes, '.^label' is used to export a label to the rest of
+\ the file only.
+
+\ Individual subroutines often but not always have a comment preceding them
+\ giving details of their behaviour and API; this is more rigorously done for
+\ low-level utility routines. In general, if the comments don't say a register
+\ or pseudo-register (oswrch_[tuvw]) is preserved, it is probably corrupted.
+
+\ Set this to TRUE for a debug build; this includes extra code to try to catch
+\ errors, and consequently is noticeably slower and larger than a normal build.
+debug = FALSE
+
+\ Set this to FALSE to disable the fast path. This is not done in any clever way
+\ and most of the code to support it is still included; this is just a
+\ convenience for debugging.
+fast_path_enabled = TRUE
+
+\ Set this to FALSE to disable assertions regarding code/tables crossing page
+\ boundaries; this may slightly harm performance, but avoids the need for
+\ fiddling around to prevent page crossings when developing.
+alignment_assertions_enabled = TRUE
+
+include "constants.beebasm"
+include "macros.beebasm"
+
+org &8000
+guard &c000
+
+include "header.beebasm"
+
+\ We include these immediately after the ROM header because they contains some
+\ checks for optimum alignment of inner loops. By putting them right here at the
+\ start, we prevent code changes elsewhere altering the alignment and driving
+\ us crazy fixing this up all the time.
+include "memset.beebasm"
+include "memmove.beebasm"
+
+include "parser.beebasm"
+include "workspace-manager.beebasm"
+include "service.beebasm"
+include "buffer.beebasm"
+
+\ On a Master, we sometimes page in ANDY to access the OS character bitmaps;
+\ this makes &8000-&8fff (andy_end) in our ROM inaccessible to us. The bulk
+\ of the terminal emulation is OK to live in this area, but some code must be
+\ located outside it.
+include "emulation-control.beebasm"
+include "escape.beebasm"
+include "bulk.beebasm"
+include "state.beebasm"
+include "cursor.beebasm"
+include "line-attributes.beebasm"
+include "report.beebasm"
+assert P% > andy_end
+include "oswrch.beebasm"
+include "print-character.beebasm"
+include "debug.beebasm"
+include "table.beebasm"
+include "workspace.beebasm"
+
+.rom_end
+save "STEM", rom_header, rom_end, &ff8000, &ff8000
+
+puttext "tests/boot.txt", "!BOOT", &0000
+
+putbasic "tests/menu.bas", "T.MENU"
+
+putbasic "tests/player.bas", "T.PLAYER"
+putfile "tests/xmasshort.vt", "D.XMASSHR", &0000
+putfile "tests/fireworks.vt", "D.FIREWRK", &0000
+
+putbasic "tests/common.bas", "T.COMMON"
+putbasic "tests/out1.bas", "T.OUT1"
+putbasic "tests/out2.bas", "T.OUT2"
+putbasic "tests/out3.bas", "T.OUT3"
+putbasic "tests/out4.bas", "T.OUT4"
+putbasic "tests/in.bas", "T.IN"
+putbasic "tests/speed.bas", "T.SPEED"
+putbasic "tests/buffer.bas", "T.BUFFER"
+putbasic "tests/fuzz.bas", "T.FUZZ"
+putfile "tests/generated/tests.dat", "D.TESTS", &0000
+putfile "tests/generated/memmove.bbc", "C.MEMMOVE", &7800
+putbasic "tests/memmove.bas", "T.MEMMOVE"

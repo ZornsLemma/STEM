@@ -1,0 +1,142 @@
+\ memset.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Optimised code for setting a block of memory to a specified value; like
+\ C's memset() but with additional support for wrapping addresses to a
+\ certain window.
+
+\ The algorithm for this code was sketched out in C first and an attempt
+\ has been made to keep the two in sync; see pseudo.c.
+
+{ \ open file scope
+
+\ Input parameters
+start = oswrch_t
+end = oswrch_u
+wrap_bottom_high = oswrch_vl
+wrap_top_high = oswrch_vh
+
+
+\ Wrap address at zero-page address X/X+1 if it's strictly greater than
+\ wrap_top.
+.wrap
+{
+    lda &01,x:cmp wrap_top_high:bcc dont_wrap:bne do_wrap
+    lda &00,x:beq dont_wrap
+.do_wrap
+    lda &01,x:sec:sbc wrap_top_high:clc:adc wrap_bottom_high:sta &01,x
+.dont_wrap
+.^wrap_rts
+    rts
+}
+
+
+\ Set memory from T/start (inclusive) to U/end (exclusive) to A. Standard
+\ wrapping is applied to keep the addresses actually read/written within
+\ the range &(VL)00-&(VH)00.
+\
+\ Preserves: VH, W
+.*memset
+{
+    ldx start+1:cpx end+1:bne not_equal
+    ldx start:cpx end:beq wrap_rts
+.not_equal
+
+    \ Save A (value to set) for later
+    pha
+
+    \ Wrap start and end if they are strictly greater than wrap_top
+    ldx #start:jsr wrap
+    ldx #end:jsr wrap
+
+    \ If start >= end...
+    lda start+1:cmp end+1:bcc start_lt_end:bne start_ge_end
+    lda start:cmp end:bcc start_lt_end
+.start_ge_end
+    \ ... we wrap around part-way through the memset, so we need to split this
+    \ into two non-wrapping memsets. memset_unwrapped(wrap_bottom, end) here...
+    lda start:pha:lda start+1:pha
+    lda #0:sta start:lda wrap_bottom_high:sta start+1
+    tsx:lda stack+3,x \ peek stacked A (value to set)
+    jsr memset_unwrapped
+    \ ... and now continue with memset_unwrapped(start, wrap_top).
+    pla:sta start+1:pla:sta start
+    lda #0:sta end:lda wrap_top_high:sta end+1
+.start_lt_end
+
+    pla \ get stacked A (value to set)
+    fall_through_to memset_unwrapped
+}
+
+
+\ As memset but no wrapping is performed, so we simply set all addresses
+\ from T/start (inclusive) to U/end (exclusive) to A.
+\
+\ Preserves: U, VH, W
+.memset_unwrapped
+{
+    \ It's safe to corrupt wrap_bottom_high by the time this gets called.
+    assert value_to_set == wrap_bottom_high
+    value_to_set = oswrch_vl
+    
+    sta value_to_set
+
+    \ Adjust start and Y so (start),Y accesses the same address but the low byte
+    \ of start is 0.
+    ldy start:lda #0:sta start
+
+    \ Set X=number of pages to set all the way to the end, i.e. excluding any
+    \ final page where we want to leave some bytes at the end untouched.
+    lda end+1:sec:sbc start+1:beq x_is_0:tax
+
+    \ Now loop round X times setting bytes from (start),Y to (start),255
+    \ each time; the high byte of start is advanced each time round the
+    \ X loop. The Y loop body is unrolled eight times so we need to do a
+    \ pre-loop to set individual bytes until Y becomes a multiple of eight,
+    \ at which point we can enter the unrolled loop body.
+.loop1_arbitrary_y
+    tya:and #%111:beq loop1_y_multiple_of_8
+    lda value_to_set:sta (start),y
+    iny:bne loop1_arbitrary_y
+    inc start+1:dex:beq x_is_0
+.loop1_y_multiple_of_8
+    lda value_to_set
+.loop1_y_multiple_of_8_body
+    for i, 1, 8
+        sta (start),y:iny
+    next
+    bne loop1_y_multiple_of_8_body
+    inc start+1:dex:bne loop1_y_multiple_of_8_body
+    xassert_branch_on_same_page loop1_y_multiple_of_8_body
+.x_is_0
+
+    tya:eor #&ff:sec:adc end:beq skip_loop2:tax \ X=lo(end)-Y
+    \ Now set X bytes from (start),Y onwards; this handles any final page
+    \ where we don't want to set all the way up to the last byte of the
+    \ page. This loop is also unrolled eight times so we need to do a pre-loop
+    \ to handle any odd bytes. (Profiling suggests the unrolling here is useful
+    \ but not absolutely essential; it's an order of magnitude less executed
+    \ than loop1_y_multiple_of_8_body.)
+.loop2_arbitrary_x
+    txa:and #%111:beq loop2_x_multiple_of_8
+    lda value_to_set:sta (start),y:iny
+    dex:bne loop2_arbitrary_x
+    xbeq_always skip_loop2
+.loop2_x_multiple_of_8
+    lda value_to_set
+.loop2_x_multiple_of_8_body
+    for i, 1, 8
+        sta (start),y:iny:dex
+    next
+    bne loop2_x_multiple_of_8_body
+.skip_loop2
+
+    rts
+}
+
+} \ close file scope

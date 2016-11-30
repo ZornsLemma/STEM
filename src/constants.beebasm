@@ -1,0 +1,481 @@
+\ constants.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Constants used throughout the rest of the source.
+
+\ This macro is used consistently throughout the source code; if you change
+\ it the ROM's title and the '*STEM' command will change accordingly. If
+\ you want to include spaces in the name or use a long name you might need
+\ to make more extensive changes.
+macro name
+    equs "STEM" \ {Stream, Steve's} Terminal EMulator
+endmacro
+version_binary = 1
+macro version_text
+    equs "0.02"
+    if not(fast_path_enabled)
+        equs "S" \ slow; mainly to make it obvious if I forget to enable this
+    endif
+    if debug
+        equs ".", TIME$("%H%M%S")
+    endif
+endmacro
+macro version_date
+    equs TIME$(" (%e %b %Y)")
+endmacro
+macro copyright
+    equs "(C)Steven Flintham 2016"
+endmacro
+
+
+\ An optional prefix which the user may add to * commands to help disambiguate
+\ them if another ROM implements a command with the same name.
+parser_star_command_optional_prefix = 'S'
+
+
+\ OS service calls
+service_offer_low_dynamic_workspace = 2
+service_command = 4
+service_help = 9
+service_offer_high_dynamic_workspace = &22
+service_count_high_dynamic_workspace = &24
+
+
+\ Constants related to the 6502 processor itself
+brk_opcode = &00
+stack = &100
+\ Bits within the flags register as stacked/unstacked with php/plp
+flag_c_bit = 1<<0
+flag_i_bit = 1<<2
+
+
+\ Operating system locations containing useful information. We access
+\ these directly, primarily to avoid any risk of (e.g.) OSBYTE trashing
+\ our zp workspace - it's probably not allowed to, but you could
+\ perhaps argue that reading these VDU-related variables counts. As a
+\ service ROM we are guaranteed to be running on the host so there are
+\ no second processor considerations here. Finally, at least according to
+\ http://mdfs.net/Docs/Comp/BBC/AllMem, these locations are used consistently
+\ across the B/B+/Master, so on a pragmatic level this seems completely safe.
+\ (Most are consistently used on the Electron too; vdu_vertical_adjust is
+\ unused on an Electron and consequently may contain garbage, but we only use it
+\ in our CRTC-related code which won't work on an Electron anyway - if we ever
+\ want to support the Electron either at build or run time we'll need custom
+\ code for it.)
+vdu_status = &d0
+    vdu_status_text_window_set = 1<<3
+    vdu_status_master_shadow_mode = 1<<4
+    vdu_status_text_at_graphics = 1<<5
+    vdu_status_screen_disabled = 1<<7
+spool_file_handle = &257
+keyboard_status = &25a
+    keyboard_status_shift = 1<<3
+    keyboard_status_ctrl = 1<<6
+vdu_queue_size = &26a \ holds 256-queue size
+vdu_vertical_adjust = &290
+vdu_text_window_left_column = &308
+vdu_text_window_bottom_row = &309
+vdu_text_window_right_column = &30a
+vdu_text_window_top_row = &30b
+screen_memory_start_high_byte = &34e
+screen_top_line_address = &350 \ 2 bytes
+screen_size_high_byte = &354
+acorn_screen_mode = &355
+vdu_cursor_start = &35f
+bbc_b_font_explosion_flags = &367 \ also B+
+bbc_b_font_location_table = &368 \ also B+
+os_keyboard_buffer = &3e0
+os_keyboard_buffer_size = &400 - os_keyboard_buffer
+rom_workspace_table = &df0
+
+
+\ OS vector-related constants
+vector_base = &200
+wrchv_number = 7
+wrchv = vector_base + 2 * wrchv_number
+insv_number = 21
+insv_extended_vector_offset = 3 * insv_number
+
+\ The number of vectors we claim; used for sizing tables and looping over them.
+our_vector_count = 4
+
+\ In theory we should use OSBYTE &A8 to determine the address of the extended
+\ vector table, but it's always here and given how many other OS locations we
+\ are accessing directly it seems silly to waste code looking this up at run
+\ time.
+extended_vector_table = &d9f
+
+
+keyboard_buffer_number = 0
+
+\ We can use the OS keyboard buffer for the OSWRCH shim because our buffer
+\ handlers relocate the keyboard buffer into our own workspace.
+oswrch_shim_ram = os_keyboard_buffer
+oswrch_shim_ram_size = os_keyboard_buffer_size
+
+
+\ On a Master, the character bitmaps are held in a separate paged bank (ANDY)
+\ which overlaps with the start of the sideways ROM region. We page ANDY in as
+\ necessary, but that means code which executes while ANDY is paged in must be
+\ located above the end of ANDY.
+andy_end = &8fff
+
+
+\ OS routines
+gsinit = &ffc2
+gsread = &ffc5
+nvwrch = &ffcb
+osbput = &ffd4
+osasci = &ffe3
+osnewl = &ffe7
+oswrch = &ffee
+osword = &fff1
+osbyte = &fff4
+
+
+\ CRTC constants
+crtc_register = &fe00
+    crtc_register_cursor_start = 10
+        crtc_cursor_start_disable_cursor = 32
+    crtc_register_screen_start_high = 12
+    crtc_register_screen_start_low = 13
+    crtc_register_cursor_position_high = 14
+    crtc_register_cursor_position_low = 15
+crtc_data = &fe01
+
+
+\ ROMSEL is read-only (at least on the B/B+) and a copy is maintained in RAM.
+\ We must always store to romsel_copy *before* storing to romsel.
+romsel = &fe30
+romsel_copy = &f4
+    \ On a Master, ANDY is paged in iff this bit is set.
+    romsel_andy = 1<<7
+
+acccon = &fe34
+    \ On a Master, shadow RAM is in main memory iff this bit is set
+    acccon_master_shadow_ram_in_main_memory = 1<<2 \ 'X' bit
+
+system_via_addressable_latch = &fe40
+    system_via_addressable_latch_caps_lock_led = 6
+    system_via_addressable_latch_shift_lock_led = 7
+
+video_ula_control_register = &fe20
+video_ula_control_ram_copy = &248
+
+
+\ On a Master, character bitmaps are stored from 32 upwards in ANDY at &8900.
+\ On a BBC B/B+, ROM character bitmaps are stored from 32 upwards at &C000.
+\ For our purposes it's convenient to calculate using a start address
+\ corresponding to character 0, although of course these don't actually exist.
+andy_bitmaps_base_0 = &8900 - 32 * 8
+bbc_b_bitmaps_base_0 = &c000 - 32 * 8
+
+
+transient_zp = &a8 \ &a8-&af inclusive (8 bytes) is transient command space
+command_ptr = &f2
+
+\ Inside the OSWRCH handler (but nowhere else), we have the following zero
+\ page locations available:
+\
+\ 1) &da-&df - this is used the OS VDU subsystem but doesn't need to be
+\    preserved across calls.
+oswrch_zp = &da
+\
+\ 2) &d6-&d7 - this is the OSWRSC pointer; we're entitled to call OSWRSC and
+\    therefore we're entitled to corrupt this.
+oswrsc_ptr = &d6
+\
+\ None of these locations can be relied on to hold their values between
+\ calls to OSWRCH or across calls we make into our parent OSWRCH handler.
+\
+\ (See http://stardot.org.uk/forums/viewtopic.php?f=2&t=10553.)
+\
+\ Strictly speaking these locations cannot be used inside other code, but
+\ we stretch a point and use them when handling * commands, on the grounds
+\ that we are entitled to call OSWRCH ourselves at these times and so callers
+\ can't assume these locations are unmodified.
+\
+\ We don't have fixed uses for these memory locations as space is just too
+\ tight. For convenience we refer to them as 4x16-bit "registers" T, U,
+\ V and W, with the low and high bytes being indicated where relevant by a
+\ suffix (e.g. TL, TH). (It's unfortunate that V clashes with the standard symbol for
+\ the overflow flag, but in most cases this doesn't cause any confusion.)
+\
+\ W is almost always used to hold a pointer into our private workspace;
+\ it's initialised almost immediately on entry to our OSWRCH handler and code
+\ which uses it for something else should re-initialise it afterwards (unless
+\ it's going to return to the caller almost immediately). To distinguish
+\ these two uses of W, we use oswrch_ww ('W workspace') where W is holding
+\ a pointer to private workspace and oswrch_w when it's being temporarily
+\ used for some other purpose.
+oswrch_t = oswrch_zp
+    oswrch_tl = oswrch_t
+    oswrch_th = oswrch_t + 1
+oswrch_u = oswrch_zp + 2
+    oswrch_ul = oswrch_u
+    oswrch_uh = oswrch_u + 1
+oswrch_v = oswrch_zp + 4
+    oswrch_vl = oswrch_v
+    oswrch_vh = oswrch_v + 1
+oswrch_w = oswrsc_ptr
+    oswrch_wl = oswrch_w
+    oswrch_wh = oswrch_w + 1
+oswrch_ww = oswrch_w
+
+\ &fa/&fb are used by the OS for temporary storage in various routines
+\ (notably the INSV handler); provided interrupts are disabled, these can
+\ be used and don't need to be preserved. &fc is used by the OS interrupt
+\ handlers and is similarly available when interrupts are disabled. (See
+\ JGH's post here: http://stardot.org.uk/forums/viewtopic.php?f=2&t=10553)
+\ We use these inside our own buffer vector handlers.
+buffer_zp = &fa \ 3 bytes
+
+
+\ ASCII codes
+bel = 7
+lf = 10
+cr = 13
+escape = 27
+del = 127
+
+
+error_number_bad_command = 254
+\ A generic error number used when generating other errors; they don't have
+\ "standard" numbers (unlike "Bad command") and aren't really intended for
+\ examination by programs.
+error_number = 255
+
+
+top_bit = 1<<7
+
+
+\ OS VDU codes
+vdu_text_at_text = 4
+vdu_text_at_graphics = 5
+vdu_enable_screen_drivers = 6
+vdu_disable_screen_drivers = 21
+vdu_set_mode = 22
+vdu_reset_text_window = 26
+vdu_set_text_window = 28
+vdu_home_upper_left = 30
+vdu_move_cursor = 31
+
+
+\ OSBYTE constants
+osbyte_identify_host = &00
+osbyte_set_keyboard_auto_repeat_delay = &0b
+osbyte_flush_specific_buffer = &15
+osbyte_reflect_keyboard_status_in_leds = &76
+osbyte_read_himem = &84
+osbyte_get_text_cursor_position = &86
+osbyte_write_video_ula_control_register = &9a
+    \ Video ULA control register values
+    vucr_mode_0_3_normal_cursor = &9c
+    vucr_mode_0_3_double_width_cursor = &dd
+osbyte_set_tab = &db
+osbyte_set_shift_function_key_interpretation = &e2
+osbyte_set_escape_status = &e5
+osbyte_set_numeric_pad_base = &ee
+osbyte_set_numeric_pad_shift = &fe
+
+
+\ OSWORD constants
+osword_read_palette = 11
+osword_write_palette = 12
+
+
+\ Special states used in the state machine used to interpret control/escape
+\ sequences. ("es"="escape state [machine state]" - a short prefix is used so
+\ the tabular layout of state_table is readable.) These have the top bit set and
+\ this causes them to be treated differently.
+es_ignore_f  = &80 \ discard 'F' character and finish sequence
+es_process   = &81 \ do normal processing on character, stay in current state
+es_parameter = &82 \ control sequence 'P' character seen, stay in current state
+es_control_f = &83 \ control sequence complete ('F' character seen)
+es_escape_f  = &84 \ escape sequence complete ('F' character seen)
+
+
+\ Bits representing line attributes. We take advantage of the individual
+\ bit values in some places (documented via assert) so don't change these
+\ willy-nilly. We also take advantage of the fact that this is either zero or
+\ at least line_attribute_double_width is set; this means we can use a simple
+\ beq/bne to test for double-width without needing to mask off the other bits.
+line_attribute_double_width = 2
+line_attribute_double_height_top = 4
+line_attribute_double_height_bottom = 8
+
+
+\ Bits representing character attributes
+\
+\ TODO: Blink isn't supported yet, and may never be, but we have a bit
+\ allocated for it. (We could in principle implement it by registering
+\ an event handler - or using the ROM polling semaphore on Master - and
+\ erasing/redrawing the blinking characters every n frames. We'd have to
+\ be very careful not to make any non-re-entrant OS calls during this,
+\ especially NVWRCH, and we'd need to preserve the zp workspace. We'd also
+\ need to take care in case we were already in the middle of NVWRCH when
+\ we were entered. This would probably be too slow if a lot of text was
+\ blinking. Alternatively we could use mode 1 instead of mode 0 with a
+\ 4-pixel-wide character set and then we could use a flashing colour to
+\ implement blinking, but that seems a poor tradeoff.)
+character_attribute_underline = 1<<0
+character_attribute_bold = 1<<1
+character_attribute_reverse = 1<<2
+character_attribute_blink = 1<<3
+
+
+\ Bits set within emulation_disabled. Only if all of these are clear (i.e.
+\ emulation_disabled is 0) is the emulation active. In practice
+\ emulation_disabled_unsupported_mode can't be set at the same time as any of
+\ the other bits.
+emulation_disabled_unsupported_mode = 1<<0
+emulation_disabled_text_window_set = vdu_status_text_window_set
+emulation_disabled_text_at_graphics = vdu_status_text_at_graphics
+emulation_disabled_screen_disabled = vdu_status_screen_disabled
+assert emulation_disabled_text_window_set  != 1<<0
+assert emulation_disabled_text_at_graphics != 1<<0
+assert emulation_disabled_screen_disabled  != 1<<0
+
+
+stored_line_len_chars = 80
+stored_line_len_bytes = 120 \ each character takes 1 byte + 4 bits of attributes
+max_screen_lines = 32
+
+
+\ Value of escape_seq_len when we are not processing an escape sequence.
+escape_seq_len_none = &ff
+
+\ When a control sequence has been parsed, parameter_count indicates the number
+\ of parameters encountered. These parameters are located sequentially in
+\ pending_escape, with the first parameter (counting from 1) at
+\ first_parameter_offset. (In fact - see vt102_escape - the first two parameters
+\ will always be defaulted to 0 if they aren't provided.)
+first_parameter_offset = 1
+
+\ Debug-only canary used to detect bugs which cause us to write past the end of
+\ pending_escape or input_buffer
+if debug
+    canary_value = 42
+endif
+
+
+vt102_tab = 9
+\ VT102 code for the pound symbol in the UK character set
+vt102_uk_set_pound_code = 35
+\ VT102 code for backtick in all character sets
+vt102_backtick_code = 96
+
+
+\ The base value we tell the OS to use when generating keycodes from the
+\ Master hardware numeric keypad. Different keypad keys get assigned codes
+\ which are a fixed offset from this value. This is chosen to minimise
+\ clashes with other keys; it makes acorn_key_keypad_enter=138, which is
+\ what "would" be the nonexistent f10 key. We're constrained in our choice;
+\ we can't make this any larger than 176 otherwise acorn_key_keypad_delete
+\ would wrap around. We can't just stick with the default because we need to
+\ be able to distinguish keypad keys from the corresponding main keyboard keys.
+acorn_key_keypad_base = 173
+
+
+\ These values are offsets into the table held at character_set_pointers.
+character_set_pointer_g0 = 0
+character_set_pointer_g1 = 1
+character_set_pointer_g2 = 2
+character_set_pointer_g3 = 3
+character_set_pointer_vt52_graphics = 4
+assert character_set_pointer_vt52_graphics + 1 == character_set_pointers_size
+
+\ These values are arbitrary; they are interpreted by code in encode_character.
+\ We make character_set_uk last as this is helpful in our_buffer_insert.
+character_set_us = 0
+character_set_special = 1
+character_set_alternate = 2
+character_set_alternate_special = 3
+character_set_uk = 4 \ must be last
+
+\ In the character encoding used by encode_character, the special graphics
+\ characters all lie below this value.
+internal_encoding_first_non_special_character = 32
+
+
+\ Bit values corresponding to the different user options; these have
+\ been chosen so that all-bits-0 is a reasonable, Acorn-friendly set of
+\ options. (This shouldn't be taken to imply that user_option_stored_screen
+\ is not Acorn-friendly; this and user_option_mode_3_gapless are somewhat
+\ orthogonal to the question of friendliness. :-) )
+user_option_32_lines = %00
+user_option_25_lines = %01
+\ %10 is interpreted as 24 - see user_option_lines_table - but we only do this
+\ so all possible user option flags bytes have a clear meaning; this could be
+\ repurposed in future. Currently there's no way to specify an arbitrary user
+\ option flags byte, so we should never see %10 anyway.
+user_option_24_lines = %11
+user_options_lines_mask = %11
+user_option_dec_us = 1<<2
+\ TODO: As a possible future option, we could use the real VT52's graphics
+\ characters in VT52 mode, instead of using the VT102 graphics characters as we
+\ currently do (and as I believe a real VT102 in VT52 mode does).
+\ user_option_vt52_graphics = 1<<3
+user_option_ignore_del = 1<<4
+user_option_ignore_unsupported = 1<<5
+user_option_mode_3_gapless = 1<<6
+user_option_stored_screen = 1<<7
+
+
+\ Bits set in vt102_flags to indicate the state of various modes.
+\
+\ Note that we track keypad mode and cursor key mode globally; they don't have
+\ separate state within VT52 mode and within ANSI mode. This is probably correct
+\ but I haven't been able to verify this.
+                                         \ clear            set
+vt102_flag_keypad_mode            = 1<<0 \ numeric keypad   application keypad
+vt102_flag_cursor_key_mode        = 1<<1 \ ANSI sequences   control functions
+vt102_flag_ansi_mode              = 1<<2 \ VT52 mode        ANSI/VT102 mode
+vt102_flag_screen_mode            = 1<<3 \ 'black on white' 'white on black'
+vt102_flag_auto_repeat_mode       = 1<<4 \ auto repeat off  auto repeat on
+vt102_flag_auto_wrap_mode         = 1<<5 \ auto wrap off    auto wrap on
+vt102_flag_linefeed_new_line_mode = 1<<6 \ 'RETURN=CR'      'RETURN=CRLF'
+vt102_flag_origin_mode            = 1<<7 \ screen           scrolling region
+\ Mask indicating the vt102_flag_* bits which are relevant for save/restore
+\ cursor attributes.
+vt102_flags_save_mask = (vt102_flag_origin_mode or vt102_flag_auto_wrap_mode)
+
+
+\ Bits set in host_flags to track information about the host Acorn machine's
+\ state (as opposed to the emulated terminal's state).
+host_flag_master                  = 1<<0 \ set => Master, clear => BBC B/B+
+host_flag_inaccessible_shadow_ram = 1<<1 \ set => we can't support shadow modes
+host_flag_our_keyboard_settings   = 1<<6 \ set => we've set our keyboard settings
+host_flag_shadow_mode             = 1<<7 \ set => we're in a shadow screen mode
+
+
+\ Bits set in fast_path_flags to indicate various reasons why the fast path
+\ can't be used; only if fast_path_flags is zero can the fast path be used.
+\ TODO: I believe fast_path_auto_wrap_pending could be moved out of
+\ fast_path_flags, as if it's set and all the other fast_path_flags are clear,
+\ we must be in column 79 and the fast path has to check for that anyway. It's
+\ not harmful to have it in here, but if we need the bit for something else it
+\ could be moved out.
+fast_path_insert_mode = 1<<0 \ clear=insert mode off/replace mode, set=insert mode
+fast_path_in_escape = 1<<1 \ set iff escape_seq_len != escape_seq_len_none
+fast_path_disabled = 1<<2 \ set=emulation is disabled
+fast_path_non_text_character_set = 1<<3 \ set iff current character set is not text-based
+fast_path_some_line_attributes = 1<<4 \ set iff current line attributes not all clear
+fast_path_some_character_attributes = 1<<5 \ set iff current character attributes not all clear
+fast_path_temporary_character_set_pointer = 1<<6 \ set iff temporary character set pointer in use
+fast_path_auto_wrap_pending = 1<<7 \ set iff auto-wrap on and auto-wrap pending
+\ Mask indicating the fast_path_* bits which are relevant for save/restore
+\ cursor attributes.
+fast_path_flags_save_mask = fast_path_temporary_character_set_pointer
+
+
+\ TODO: I should probably use these named constants everywhere, but it actually
+\ feels clearer to use the literals somehow.
+\ screen_row_size = 640
+\ single_width_line_len_minus_1 = 79
+\ double_width_line_len_minus_1 = 39

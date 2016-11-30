@@ -1,0 +1,496 @@
+\ workspace-manager.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Implementations of OS service calls related to allocation of workspace, plus
+\ associated utility routines.
+
+\ We only have one byte of "permanent" workspace, the ROM's private workspace
+\ byte at rom_workspace_table + ROM number. We can claim workspace from the OS
+\ but on BREAK (BBC B/B+) or CTRL-BREAK (Master) that memory gets re-allocated
+\ and the old contents could be lost. (Imagine that on the first BREAK we are
+\ assigned workspace starting at &1900. The user then loads another ROM into
+\ a higher priority RAM bank and presses BREAK again. The other ROM claims a
+\ page of workspace at &1900 and we are assigned workspace starting at &1a00;
+\ any data we had at &1900 is gone.) If we're running from sideways RAM we
+\ have workspace in our sideways RAM bank which is permanent, but unless we
+\ want to implement sideways RAM-only features, the only permanent workspace
+\ we can rely on is the ROM private workspace byte.
+
+\ TODO: This unfortunately seems to rule out the possibility of allowing
+\ the emulation to remain active across BREAK/CTRL-BREAK. We would struggle
+\ to even find 1 bit to store the "remain active across BREAK/CTRL-BREAK"
+\ flag, but we could probably do it. However, we'd have nowhere to store
+\ the emulation settings (the options passed to *VT52/*VT102) to use when
+\ we claimed the vectors on BREAK/CTRL-BREAK; we could turn on with a set
+\ of default options, I suppose.
+\
+\ The private workspace byte starts off as 0 initially, so our interpretation
+\ of 0 is chosen to claim workspace if we can do so unintrusively otherwise
+\ not to.
+\
+\ We use the private workspace byte as follows:
+\ %00sxxxxx - enabled, workspace at &(0D+xxxxx)00 (up to &2C00) or special
+\ %01xxxxxx - disabled (we process no service calls at all)
+\ %10sxxxxx - special
+\ %11sxxxxx - enabled, workspace at &(C0+xxxxx)00 (up to &DF00, private 
+\             workspace ends at &DBFF). If this indicates workspace at
+\             high_private_workspace_end (an invalid address) it means we tried
+\             to claim high private workspace and failed so we should try from
+\             main RAM; this state only exists transiently between the high 
+\             private RAM service calls and the main RAM service call.
+\
+\ Special cases are:
+\ %00s00000 - claim s-sized sideways RAM if available, otherwise small high
+\             workspace if available (s ignored, private workspace byte
+\             is changed to indicate high workspace), otherwise claim no
+\             workspace (an 'unintrusive' claim)
+\ %10xxxxxx - we don't currently have workspace, with subcases:
+\ %10000000 - never claim workspace
+\ %10s00001 - no workspace but want workspace of size 's' on BREAK
+\ %10s00010 - ditto, but indicating we failed to claim workspace last reset due
+\             to it starting too high for us to handle
+\
+\ s ('size') indicates the desired size of the private workspace on the next
+\ reset and the current size of workspace if we have any - 0 for large,
+\ 1 for small. (s=0 means large so a 0 workspace byte will claim large
+\ workspace if we're running from sideways RAM.) Because we don't try to
+\ record current and desired workspace size separately, any request to change
+\ the workspace size will turn off the emulation; command_stem takes care
+\ of this. We could possibly be a little bit cleverer about this, but we're
+\ tight on space in the private workspace byte and there seems little reward
+\ for the extra complexity - normally the user will give us permission to
+\ claim workspace once and that's that.
+
+workspace_size_bit = 1<<5
+workspace_main_ram_offset = &0d
+
+rom_workspace_byte_want_none             = %10000000
+rom_workspace_byte_want_small            = %10100001
+rom_workspace_byte_want_large            = %10000001
+assert rom_workspace_byte_want_large or workspace_size_bit == rom_workspace_byte_want_small
+
+rom_workspace_byte_top_bits_mask         = %11000000
+rom_workspace_byte_top_bits_disabled     = %01000000
+rom_workspace_byte_top_bits_no_workspace = %10000000
+
+rom_workspace_byte_high_workspace_bits   = %11000000
+
+\ TODO: Tracking this as a distinct state is a bit of a luxury, given how rare
+\ it is; if we're short of space we can drop support for it.
+rom_workspace_byte_too_high              = %10000010
+
+
+\ RTS if the ROM is completely disabled by the private workspace byte. This
+\ is used at the start of the service call handler.
+\
+\ On entry:
+\   X is the ROM number
+\
+\ On exit:
+\   A, X, Y are preserved
+macro rts_if_rom_disabled
+    pha
+    lda rom_workspace_table,x
+    and #rom_workspace_byte_top_bits_mask
+    cmp #rom_workspace_byte_top_bits_disabled
+    bne not_disabled
+    pla
+    rts
+.not_disabled
+    pla
+endmacro
+
+
+\ Populate zp and zp+1 with the low and high bytes respectively of the ROM's
+\ private workspace. The caller is responsible for ensuring the ROM *has*
+\ workspace.
+\
+\ A, X and Y are all corrupted
+macro init_workspace_ptr zp
+    xassert_have_workspace
+    \ Because the caller guarantees we *do* have workspace, we don't have to
+    \ worry about some possible interpretations of the private workspace byte.
+    \ In particular, after masking off the 'desired size' bit:
+    \ - 0 means we are using sideways RAM workspace
+    \ - the 'ROM is disabled' cases can't occur
+    lda #0:sta zp
+    lda romsel_copy:xand_not romsel_andy:tax
+    lda rom_workspace_table,x
+    xand_not workspace_size_bit
+    bne not_in_sideways_ram
+    lda #hi(swr_workspace)
+    xbne_always high_byte_in_a
+.not_in_sideways_ram
+    cmp #rom_workspace_byte_high_workspace_bits
+    bcs high_byte_in_a \ branch if have high workspace
+    xclc:adc #workspace_main_ram_offset
+.high_byte_in_a
+    sta zp+1
+    if debug
+        lda #42:tax:tay
+    endif
+endmacro
+
+
+\ Return so that BEQ will branch if we have large workspace, BNE will be branch
+\ if we have small workspace. The caller is responsible for ensuring the ROM
+\ *has* workspace.
+macro eq_iff_large_workspace
+    xassert_have_workspace
+    ldx romsel_copy
+    lda rom_workspace_table,x
+    and #workspace_size_bit
+endmacro
+
+
+{ \ open file scope
+
+\ If main RAM workspace starts any higher than this, we can't represent it in
+\ our private workspace byte.
+max_main_ram_workspace_start_page = workspace_size_bit - 1 + workspace_main_ram_offset
+
+high_private_workspace_end = &dc00 \ exclusive; last byte is &dbff
+
+\ I don't know of any formal allocation of zero page workspace for handling
+\ these service calls, but as elsewhere we use the OSWRCH zero page locations on
+\ the grounds that we 'could' call OSWRCH, so it's OK to corrupt them. (We don't
+\ rely on these bytes being preserved between service calls.)
+current_workspace_size_bit = oswrch_zp
+
+
+\ There are a few places in here where we use loops to add/subtract X to/from
+\ Y. This seems silly, but this code isn't performance critical and it's
+\ much simpler than faffing around transferring values into A to perform
+\ arithmetic on them.
+
+
+\ Handler for service call service_count_high_dynamic_workspace; decrements Y by
+\ the number of pages of high dynamic workspace we'd like.
+\
+\ Preserves: A, X
+\ Updates: Y
+.*workspace_handler_count_high_dynamic_workspace
+{
+    \ We can take advantage of the CMOS instructions in this Master-only code.
+    cpu 1
+
+    jsr check_if_high_private_workspace_required
+
+    { .loop:dey:dex:bne loop } \ Y=Y-X
+
+.done
+    lda #service_count_high_dynamic_workspace
+    ldx romsel_copy
+    rts
+    
+    cpu 0
+}
+
+
+\ Handler for service call service_offer_high_dynamic_workspace; Y points to the
+\ first available (incrementing) page of high dynamic workspace on entry. If
+\ there's enough high dynamic workspace available for us, we increment Y
+\ by the number of pages we want to claim and save the original value of Y
+\ (suitably encoded) in our private workspace byte.
+
+\ Preserves: A, X
+\ Updates: Y
+.*workspace_handler_offer_high_dynamic_workspace
+{
+    \ We can take advantage of the CMOS instructions in this Master-only code.
+    cpu 1
+
+    jsr check_if_high_private_workspace_required
+
+    tya \ A = start of our workspace if our claim is successful
+    { .loop:iny:dex:bne loop } \ Y=Y+X
+
+    \ Y now contains the high byte of the address the *next* ROM wanting memory
+    \ in private workspace will start at. If Y <= hi(high_private_workspace_end)
+    \ we're OK as our workspace will fit, otherwise we can't get enough private
+    \ workspace.
+    ldx romsel_copy
+    cpy #(hi(high_private_workspace_end)+1):bcc claim_succeeded
+    \ There isn't enough private workspace for us; restore the original Y since
+    \ there might be enough for a lower priority ROM. (Unfortunately our earlier
+    \ response to service_count_high_dynamic_workspace will mean that the
+    \ high shared workspace is sized to be the minimum size demanded by any ROM
+    \ and it won't be able to grow to take advantage of any free space, which
+    \ will instead sit above the private workspace. There doesn't seem to be
+    \ much we can do about this.)
+    tay
+    \ If this was an attempt at an unintrusive claim, we leave the
+    \ private workspace byte alone so that we don't claim any main RAM
+    \ as workspace, otherwise we set A=hi(high_private_workspace_end)
+    \ and store it in our private workspace byte to signal to
+    \ workspace_handler_offer_low_dynamic_workspace that it needs to claim
+    \ workspace in main RAM.
+    lda rom_workspace_table,x:xand_not workspace_size_bit:beq done
+    lda #hi(high_private_workspace_end)
+.claim_succeeded
+    \ Save A in our private workspace byte, preserving the size bit already
+    \ there so that we know how big our workspace is and so that subsequent
+    \ resets claim the same size workspace.
+    ora current_workspace_size_bit:sta rom_workspace_table,x
+
+.done
+    \ Restore A (X is already our ROM number) and exit
+    lda #service_offer_high_dynamic_workspace
+    rts
+
+    cpu 0
+}
+
+
+\ check_if_high_private_workspace_required returns to the caller's caller if
+\ no high workspace is required, otherwise it updates the private workspace
+\ byte if necessary and returns with the number of pages of workspace
+\ required in X and the workspace size bit (only) from the private workspace
+\ byte in current_workspace_size.
+\
+\ Preserves: Y if returns to caller, A/X/Y if returns to caller's caller
+\
+\ On exit (if we return to our caller):
+\   A is corrupted
+\   X is number of pages of workspace required
+\   Y is preserved
+\   workspace_size_bit is the size bit (only) from the private workspace byte
+{
+    \ We can take advantage of the CMOS instructions in this Master-only code.
+    cpu 1
+
+.not_wanted
+    pla
+    plx:plx \ discard our return address
+    ldx romsel_copy
+    \ Return to our caller's caller with all registers preserved
+    rts
+
+.^check_if_high_private_workspace_required
+    pha
+
+    \ Are we running from sideways RAM? If we are, we will use it as workspace
+    \ if we want any so we definitely don't want to claim high private
+    \ workspace.
+    jsr ne_iff_sideways_ram:bne not_wanted
+
+    \ We're running from ROM. Does the user want us to claim workspace?
+    lda rom_workspace_table,x
+    cmp #rom_workspace_byte_want_none:beq not_wanted
+    xand_not workspace_size_bit:bne not_unintrusive
+    \ A zero (ignoring size bit) private workspace byte indicates 'unintrusive'
+    \ and on a Master we default to small workspace when in ROM, since we can
+    \ almost certainly satisfy that from high private workspace. (If we can't,
+    \ we don't claim any main RAM workspace.) We force the workspace_size_bit
+    \ on in the private workspace byte so that we know we have small workspace.
+    \ (if any).
+    pla
+    lda #workspace_size_bit:sta rom_workspace_table,x:sta current_workspace_size_bit
+    ldx #hi(small_workspace_size)
+    rts
+.not_unintrusive
+    pla
+
+    \ We're running from ROM and the user wants us to claim workspace,
+    \ so we'd like high private workspace if it's available.
+    
+    fall_through_to workspace_size_to_x_and_current_workspace_size_bit
+
+    cpu 0
+}
+
+
+\ On entry:
+\   X is current ROM number
+\
+\ On exit:
+\   A is corrupted
+\   X is number of pages of workspace required
+\   Y is preserved
+\   workspace_size_bit is the size bit (only) from the private workspace byte
+.workspace_size_to_x_and_current_workspace_size_bit
+{
+    lda rom_workspace_table,x
+    ldx #hi(small_workspace_size)
+    and #workspace_size_bit
+    sta current_workspace_size_bit
+    bne small_workspace
+    ldx #hi(small_workspace_size)+hi(stored_screen_size)
+.small_workspace
+    rts
+}
+
+
+\ Handler for service call service_offer_low_dynamic_workspace; Y points
+\ to the first available (incrementing) page of low dynamic workspace on
+\ entry. If we want to claim any, we increment Y by the number of pages we
+\ want to claim and save the original value of Y (suitably encoded) in our
+\ private workspace byte.
+\
+\ Preserves: A, X
+\ Updates: Y
+.*workspace_handler_offer_low_dynamic_workspace
+{
+    \ If we explicitly don't want workspace under any circumstances, we're done.
+    lda rom_workspace_table,x
+    cmp #rom_workspace_byte_want_none:beq done
+    xand_not workspace_size_bit:pha
+
+    \ Are we running from sideways RAM? If we are, we will use it as workspace.
+    jsr ne_iff_sideways_ram:beq not_in_sideways_ram
+    pla
+    \ Update the private workspace byte to indicate the appropriate size but be
+    \ otherwise 0 to indicate unintrusive workspace (= sideways RAM, since we
+    \ have it).
+    lda rom_workspace_table,x:and #workspace_size_bit:sta rom_workspace_table,x
+.done
+    lda #service_offer_low_dynamic_workspace
+    ldx romsel_copy
+    rts
+
+.not_in_sideways_ram
+    \ We're running from ROM. Does the user want us to claim workspace?
+    pla:beq done \ 0 is the "unintrusive" case so we don't want main RAM workspace
+
+    \ If the private workspace byte indicates an address in high
+    \ private workspace which (after masking off the size bit) isn't
+    \ high_private_workspace_end, we've already claimed high private workspace.
+    cmp #rom_workspace_byte_high_workspace_bits:bcc try_main_ram
+    cmp #hi(high_private_workspace_end):bne done \ we have high private workspace
+
+.try_main_ram
+    \ We're running from ROM and the user wants us to claim workspace,
+    \ and we have to do it from main RAM.
+
+    jsr workspace_size_to_x_and_current_workspace_size_bit
+    cpy #max_main_ram_workspace_start_page+1:bcs workspace_too_high
+    tya \ A=start of our workspace (if our claim is successful)
+    { .loop:iny:dex:bne loop } \ Y=Y+X
+    \ Save (A-workspace_main_ram_offset) in our private workspace byte,
+    \ preserving the size bit already there so that we know how large our
+    \ workspace is and so that subsequent resets claim the same size workspace.
+    sec:sbc #workspace_main_ram_offset
+    ldx romsel_copy:ora current_workspace_size_bit:sta rom_workspace_table,x
+    xbne_always done
+
+.workspace_too_high
+    \ Our workspace would start at an address at or above
+    \ max_main_ram_workspace_start_page; this should be very rare but in any
+    \ case we can't store this address given our encoding of the private
+    \ workspace byte. Set the private workspace byte to a distinctive value to
+    \ indicate this, preserving the size bit so we know what size to try to
+    \ acquire on the next reset.
+    lda #rom_workspace_byte_too_high:ora current_workspace_size_bit
+    sta rom_workspace_table,x
+    xbne_always done
+}
+
+
+\ Returns so BNE will branch iff we are running from sideways RAM (as opposed
+\ to ROM).
+\
+\ Preserves: X, Y
+.ne_iff_sideways_ram
+{
+    \ We do a DEC-INC pair to make this non-destructive; it matters if we
+    \ are using this to check for the existence of sideways RAM once we've
+    \ already claimed workspace. (Of course, the user could press BREAK in
+    \ between the DEC and the INC, but that's OK because on BREAK we lose
+    \ any claim we have on the vectors and if the user issues a * command
+    \ to reclaim them, we'll re-initialise the workspace.) There is a small
+    \ chance one of our buffer handlers is accessing workspace from an interrupt
+    \ in the middle of this, but that's OK because this byte of workspace isn't
+    \ used from those handlers.
+    dec swr_workspace
+    lda swr_workspace
+    inc swr_workspace
+    cmp swr_workspace
+    rts
+}
+
+
+\ Returns so that BEQ will branch iff we have no workspace.
+\
+\ Preserves: Y
+.*ne_iff_workspace
+{
+    \ Private workspace byte (with size bit masked off) of 0 means we have
+    \ workspace iff we are running from sideways RAM.
+    ldx romsel_copy:lda rom_workspace_table,x:xand_not workspace_size_bit
+    beq ne_iff_sideways_ram
+    and #rom_workspace_byte_top_bits_mask:cmp #rom_workspace_byte_top_bits_no_workspace
+    rts
+}
+
+
+\ Print out some information about the current workspace (if any) and what
+\ workspace we will try to obtain on the next reset.
+.*print_workspace_status
+{
+    ldx romsel_copy:lda rom_workspace_table,x:pha
+    jsr print_inline:equs "Current workspace:", top_bit or ' '
+    jsr ne_iff_workspace:beq no_workspace
+    pla:pha:and #workspace_size_bit:jsr print_size
+    jsr print_inline:equs " at ", top_bit or '&'
+    jsr init_oswrch_ww_corrupt_axy
+    lda oswrch_ww+1:jsr print_a_hex
+    lda #0:jsr print_a_hex
+    jmp done_current_workspace
+.no_workspace
+    jsr print_inline:equs "non", top_bit or 'e'
+    pla:pha
+    xand_not workspace_size_bit
+    cmp #rom_workspace_byte_too_high:bne done_current_workspace
+    jsr print_inline:equs " as RAM too ful", top_bit or 'l'
+.done_current_workspace
+    jsr print_inline:equs cr, "Next reset workspace:", top_bit or ' '
+    pla:pha
+    xand_not workspace_size_bit
+    tax:pla:cpx #rom_workspace_byte_want_none:beq never_claim_workspace
+    pha
+    and #workspace_size_bit
+    jsr print_size
+    pla
+    xand_not workspace_size_bit
+    bne not_unintrusive
+    jsr print_inline:equs " unintrusiv", top_bit or 'e'
+.not_unintrusive
+    jmp osnewl
+.never_claim_workspace
+    jsr print_inline:equs "non", top_bit or 'e'
+    jmp osnewl
+
+.print_size
+    beq large
+    jsr print_inline:equs "smal", top_bit or 'l'
+    rts
+.large
+    jsr print_inline:equs "larg", top_bit or 'e'
+    rts
+}
+
+
+\ Print the value in A as a two digit hexadecimal number.
+\
+\ Preserves: X, Y
+.print_a_hex
+{
+    pha:lsr a:lsr a:lsr a:lsr a:jsr print_a_nybble_hex
+    pla:and #%00001111:fall_through_to print_a_nybble_hex
+.print_a_nybble_hex
+    \ This is fractionally smaller than using a table of "0123456789ABCDEF"...
+    cmp #10:bcc lt_10
+    xsec:sbc #10
+    xsec \ smallest subtraction result is 0, so carry remains set
+    adc #('A'-1) \ -1 to compensate for carry being set
+    jmp oswrch
+.lt_10
+    xclc:adc #'0':jmp oswrch
+}
+
+} \ close file scope

@@ -1,0 +1,111 @@
+\ report.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Implementations of escape sequences which report the status of the emulated
+\ terminal back to the application (by inserting escape sequences into the input
+\ buffer).
+
+{ \ open file scope
+
+\ We've seen <ESC>[...n
+.*report
+{
+    xassert_oswrch_ww_valid
+    ldy #private_parameter_offset:lda (oswrch_ww),y:bne private_parameter
+    jsr get_raw_first_parameter_in_a
+    cmp #5:beq status_report
+    cmp #6:beq cursor_position_report
+.ignore
+    rts
+
+    \ We've seen <ESC>[5n (DSR), a request for a device status report.
+.status_report
+    jsr insert_inline_string_in_input_buffer:equs escape, "[0", top_bit or 'n'
+    \ never returns; control transferred to finish_escape
+
+.cursor_position_report
+    \ We must disable interrupts here, so that keypresses can't fiddle with the
+    \ buffer (including the free count) while we're inserting.
+    php:sei
+
+    \ Assume the worst case (both row and column are two digits) when
+    \ checking for space in input buffer.
+    jsr get_free_bytes_for_priority_in_input_buffer_in_a
+    cmp #8:bcc plp_rts
+
+    \ Get the cursor co-ordinates, allowing for origin mode. We stack
+    \ *0-based* X then *0-based* Y, so we need to add one to both before
+    \ outputting later on.
+    xassert_oswrch_ww_valid
+    assert vt102_logical_cursor_x_offset + 1 == vt102_cursor_y_offset
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:pha
+    iny:lda (oswrch_ww),y:pha
+    ldy #vt102_flags_offset:lda (oswrch_ww),y
+    assert vt102_flag_origin_mode == 1<<7
+    bpl origin_mode_reset
+    \ Origin mode is set, so we need to subtract the top margin from Y
+    pla
+    ldy #top_margin_offset:sec:sbc (oswrch_ww),y
+    pha
+.origin_mode_reset
+
+    lda #escape:jsr insert_a_in_input_buffer
+    lda #'[':jsr insert_a_in_input_buffer
+    pla:clc:adc #1:jsr insert_a_as_decimal_in_input_buffer
+    lda #';':jsr insert_a_in_input_buffer
+    pla:clc:adc #1:jsr insert_a_as_decimal_in_input_buffer
+    lda #'R':jsr insert_a_in_input_buffer
+
+.plp_rts
+    \ Restore previous interrupt state (probably enabled, but we don't assume
+    \ that)
+    plp
+
+.^report_rts
+    rts
+
+.private_parameter
+    jsr get_raw_first_parameter_in_a
+    cmp #15:bne ignore
+
+    \ We've seen <ESC>[?15n; request printer status report.
+    \ TODO: For now we don't support printing, so we always say there's no
+    \ printer.
+    jsr insert_inline_string_in_input_buffer:equs escape, "[?13", top_bit or 'n'
+    \ never returns; control transferred to finish_escape
+}
+
+
+\ We've seen <ESC>Z in VT52 mode
+.*vt52_identify
+{
+    jsr insert_inline_string_in_input_buffer:equs escape, "/", top_bit or 'Z'
+    \ never returns; control transferred to finish_escape
+}
+
+\ We've seen <ESC>[...c (probably DA)
+.*device_attributes
+{
+    \ Device attributes is really <ESC>[c or <ESC>[0c, so check for that.
+    xassert_oswrch_ww_valid
+    ldy #private_parameter_offset:lda (oswrch_ww),y
+    bne report_rts \ ignore if private parameter
+    ldy #parameter_count_plus_one_offset:lda (oswrch_ww),y
+    cmp #3:bcs report_rts \ ignore if two or more parameters
+    jsr get_raw_first_parameter_in_a:bne report_rts
+    fall_through_to ansi_identify_terminal
+}
+
+\ We've seen <ESC>Z (DECID) (in ANSI mode)
+.*ansi_identify_terminal
+{
+    jsr insert_inline_string_in_input_buffer:equs escape, "[?6", top_bit or 'c'
+    \ never returns; control transferred to finish_escape
+}
+
+} \ close file scope

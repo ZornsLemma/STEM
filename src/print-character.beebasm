@@ -1,0 +1,738 @@
+\ print-character.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Character printing subroutine and character set data
+
+{ \ open file scope
+
+character_attributes = oswrch_tl
+line_attributes = oswrch_th
+
+
+\ We're using a special graphics character; A is the internal character code
+\ (see encode_character), 0<A<32.
+.special_character
+{
+    \ Handily, there are only 32 special characters, so we can multiply
+    \ by 8 without overflowing our 8-bit accumulator.
+    asl a:asl a:asl a
+    \ We use special_character_bitmaps-8 as the first bitmap is for
+    \ internal character code 1.
+    \ TODO: If we arranged for (special_character_bitmaps-8) to be page-aligned,
+    \ we could use A directly as the low byte and the high byte would be
+    \ constant so we'd avoid the 'ADC #0'.
+    clc:adc #lo(special_character_bitmaps-8):sta oswrch_vl
+    lda #hi(special_character_bitmaps-8):adc #0:sta oswrch_vh
+    xbne_always direct_screen_write
+}
+
+
+\ Write a character to the video RAM.
+\
+\ On entry:
+\   A contains the character to print (as encoded by encode_character)
+\   X contains the character attributes
+\   Y contains the line attributes
+\
+\ On exit:
+\   All registers are corrupted
+\   All zp workspace except W is corrupted
+\
+\   vt102_logical_cursor_x will be incremented by one if it wasn't already at
+\   the end of the line (character width is taken into account)
+\
+\   Hardware cursor position is *not* modified
+.*print_character
+    stx character_attributes
+    sty line_attributes
+
+    \ For non-(Acorn)-standard characters, we need to use our own bitmap.
+    cmp #internal_encoding_first_non_special_character
+    bcc special_character
+    \ At this point A contains a standard Acorn-ASCII code.
+    jsr init_oswrch_v_to_read_only_os_bitmap
+    fall_through_to direct_screen_write
+
+
+.direct_screen_write
+    \ At this point V points to the character bitmap to output, but this
+    \ bitmap should not be modified. (It *may* be in RAM, but this isn't
+    \ necessarily the case and even if it is it's the master copy of this
+    \ bitmap and mustn't be corrupted.)
+
+    jsr page_in_video_ram
+
+    \ If we're going to output the character with no modification in single or
+    \ double width, we don't need to copy the bitmap into RAM first. (This
+    \ will actually send double-width, single-height bold text through
+    \ ...not_simple, which isn't necessary, but it's not harmful and it's
+    \ fiddly to detect this case.)
+    lda line_attributes:xand_not line_attribute_double_width
+    ora character_attributes
+    bne direct_screen_write_not_simple
+    fall_through_to direct_screen_write_simple
+
+.direct_screen_write_simple
+    \ Set U to the address to write to in the video RAM.
+    xassert_oswrch_ww_valid
+    assert vt102_logical_cursor_x_offset + 1 == vt102_cursor_y_offset
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:sta oswrch_ul
+    iny:lda (oswrch_ww),y
+    ldy oswrch_ul
+    ldx #oswrch_u
+    jsr get_video_ram_character_address_logical_x_wrapped
+
+    \ Advance vt102_logical_cursor_x by 1 if we're not at the end of the line.
+    {
+        ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y
+        cmp #79
+        ldx line_attributes:beq not_double_width
+        cmp #39
+    .not_double_width
+        bcs at_line_end
+        xclc
+        adc #1
+        sta (oswrch_ww),y
+    .at_line_end
+    }
+
+    \ We have the required character bitmap pointed to by V and the target
+    \ video RAM pointed to by U, so we almost just need to copy from V to U. We
+    \ must not modify the memory pointed to by V; it may be the master copy
+    \ of the bitmap. We do however need to handle double-width characters,
+    \ with bold double-width characters getting additional special treatment.
+    txa:bne double_width
+
+    ldy #7
+    {
+    .loop
+	lda (oswrch_v),y:sta (oswrch_u),y
+	dey:bpl loop
+    }
+    fall_through_to common_end
+
+.common_end
+    xassert_oswrch_ww_valid
+
+    page_out_andy
+    jmp page_in_main_ram \ print_character effectively finishes here
+
+\ Copy the character bitmap at V to video RAM at U, doubling up the pixels as
+\ this is a double-width line.
+.double_width
+{
+    \ Double-width characters need to be pixel-doubled up (obviously).
+    \ Because this effectively gives them twice the normal horizontal
+    \ resolution, we are able to use this to make each vertical stroke
+    \ 1.5 times as wide as normal to represent bold text. This avoids
+    \ the compromises and complexities needed to avoid ugly bold
+    \ single-width characters, although on the downside it does mean
+    \ that the boldness is not as noticeable (since single-width bold
+    \ does (approximately) double the width of each vertical stroke,
+    \ and this is just 1.5 times).
+
+    clv \ V clear indicates left half, V set indicates right half
+.half_loop
+    ldy #7
+.scan_line_loop
+    lda (oswrch_v),y
+    bvs right_half
+    \ left half
+    lsr a:lsr a:lsr a:lsr a
+.right_half
+    and #%1111
+    tax
+    lda character_attributes:and #character_attribute_bold:beq not_bold
+    lda double_width_table,x:lsr a
+.not_bold
+    ora double_width_table,x
+    sta (oswrch_u),y
+    dey:bpl scan_line_loop
+    bvs done
+    lda oswrch_ul:clc:adc #8:sta oswrch_ul
+    { bcc no_carry:inc oswrch_uh:.no_carry }
+    set_v_clear_n_corrupt_z
+    xbvs_always half_loop
+
+.done
+    jmp common_end
+}
+
+
+.direct_screen_write_not_simple
+{
+    \ We need to copy the character bitmap into RAM so it can be modified
+    \ before being copied into video RAM. We handle the copy into RAM via
+    \ three distinct cases:
+    \ - single-width bold characters
+    \ - double-height characters
+    \ - everything else
+
+    \ Set U to point to the master bitmap we're going to work from.
+    lda oswrch_vl:sta oswrch_ul
+    lda oswrch_vh:sta oswrch_uh
+
+    \ Set V to point to the bitmap workspace within our private workspace.
+    xassert_oswrch_ww_valid
+    lda #bitmap_offset:sta oswrch_vl
+    lda oswrch_ww+1:sta oswrch_vh
+
+    \ Is it a double-height character?
+    lda line_attributes
+    assert line_attribute_double_height_top == 4
+    assert line_attribute_double_height_bottom == 8
+    and #(line_attribute_double_height_top or line_attribute_double_height_bottom)
+    beq not_double_height
+
+    \ It's a double-height character, so copy the relevant half into the memory
+    \ pointed to by V.
+    tay
+    ldx #4
+    {
+    .loop
+	dey:lda (oswrch_u),y
+	pha:pha
+        dex:bne loop
+    }
+    ldy #0
+    {
+    .loop
+	pla
+	sta (oswrch_v),y
+	iny
+	cpy #8:bne loop
+    }
+    xbeq_always copied_to_ram
+}
+
+
+.not_double_height
+{
+    \ OK, is it a single-width bold character?
+    lda character_attributes:and #character_attribute_bold:beq not_single_width_bold
+    lda line_attributes:bne not_single_width_bold
+
+    work = oswrch_wl
+    smear_mask = oswrch_wh
+
+    \ For the purposes of the following algorithm description, white=bit
+    \ set=foreground, black=bit clear=background.
+    \
+    \ Yes, it's single-width bold. We need to derive a suitable 8x8 bold
+    \ character bitmap. A naive 'smear each character row to the right'
+    \ approach - more formally 'take each byte, shift it right one bit
+    \ then or it with itself' - works quite well but some characters
+    \ (e.g. 'm' and 'w') have single-pixel-wide gaps and look terrible
+    \ under this approach.
+    \
+    \ We therefore take a more fiddly approach; we avoid smearing a column
+    \ to the right if doing so would obliterate any 2 highx1 wide black
+    \ pixel regions.  This causes slightly ragged bold (the vertical
+    \ strokes of 'm' and 'w' are no wider in bold than in ordinary text)
+    \ but does overall give a more readable effect.
+
+    \ Step 1 is to take the read-only character data at oswrch_u. For each
+    \ row we derive a value white_in_both_shifts = (row << 1) & (row >> 1),
+    \ which has a bit set only where a column has a white pixel to the left and
+    \ to the right. We then calculate
+    \ white_in_both_shifts_and_originally_black = white_in_both_shifts &
+    \ ~row, which has a bit set only where a column has a white pixel to the
+    \ left and to the right and is black in the original row. This is stored
+    \ at oswrch_v.
+    ldy #7
+    sta smear_mask \ A is 0 here; 'bne' didn't branch
+    {
+    .loop
+	lda (oswrch_u),y
+	lsr a
+	sta work
+	lda (oswrch_u),y
+	asl a
+	and work \ A is now white_in_both_shifts
+	sta work 
+	lda (oswrch_u),y
+	eor #255
+	and work \ A is now white_in_both_shifts_and_originally_black
+	sta (oswrch_v),y
+	dey:bpl loop
+    }
+
+    \ Step 2 is to use the bitmap we just built up in oswrch_v. For each row
+    \ n, we calculate x_n=(row[n-1] | row[n+1]) & row[n])). This has a bit set
+    \ only where the original character row had a black pixel with a white
+    \ pixel on either side (row[n]) and there is such a pixel in one or both
+    \ of the adjacent rows as well. We calculate smear_mask=x_1 | x_2 | ... |
+    \ x_6. What we are effectively doing here is identifying column which, if
+    \ the column to the immediate left was smeared right, would lose a
+    \ single-pixel black region at least two pixels high. (The idea is that
+    \ fine detail represented by a single black pixel needn't prevent
+    \ smearing, but something more substantial like the central part of an
+    \ 'm' or 'w' needs to be preserved.)
+    ldy #7
+    {
+    .loop
+	lda (oswrch_v),y
+	dey:dey:ora (oswrch_v),y
+	iny:and (oswrch_v),y
+	ora smear_mask
+	sta smear_mask
+	cpy #1:bne loop
+    }
+    \ We now flip smear_mask's bits, so it has a 1 where a column doesn't
+    \ contain "fine detail" and a 0 where it does.
+    \ lda smear_mask - redundant
+    eor #255:sta smear_mask
+
+    \ Step 3 is to perform the "naive smear", but when we shift each row to
+    \ the right one, we AND it with smear_mask so that we won't smear a
+    \ column if it would obliterate fine detail.
+    ldy #7
+    {
+    .loop
+	lda (oswrch_u),y
+	lsr a:and smear_mask
+	ora (oswrch_u),y
+	sta (oswrch_v),y
+	dey:bpl loop
+    }
+    jsr init_oswrch_ww_vectors_claimed \ we corrupted this
+    jmp copied_to_ram
+}
+
+
+.not_single_width_bold
+{
+    \ OK, it's not double-height or a single-width bold character, so let's
+    \ just copy it into RAM without modification before we proceed with the
+    \ common modification code.
+    ldy #7
+.loop
+    lda (oswrch_u),y
+    sta (oswrch_v),y
+    dey:bpl loop
+    fall_through_to copied_to_ram
+}
+
+
+.copied_to_ram
+{
+    \ V now points to the character bitmap in RAM. We proceed to do further
+    \ modification on it according to the attributes.
+
+    assert character_attribute_underline == 1<<0
+    lda character_attributes:lsr a:bcc not_underlined
+    lda line_attributes:and #line_attribute_double_height_top:bne not_underlined
+
+    \ The character is underlined, so add underlining in scan line 7. By
+    \ doing this after we took the bottom half of a double-height character,
+    \ they get a single pixel high underline which doesn't touch the row
+    \ of pixels above. (The alternative would be to add the underline on
+    \ the original 8x8 character matrix, which would give a two pixel high
+    \ underline - just a scaled up version of the single-height underline.)
+    ldy #7:lda (oswrch_v),y
+
+    \ We leave a blank pixel either side of any character pixels in scan line 7;
+    \ this means that descenders aren't obliterated.
+    lsr a:sta oswrch_ul
+    lda (oswrch_v),y:asl a:ora oswrch_ul
+    eor #255
+    ora (oswrch_v),y
+
+    sta (oswrch_v),y
+.not_underlined
+
+    lda character_attributes:and #character_attribute_reverse:beq not_reverse
+
+    \ The character is reverse video, so flip all the bits.
+    ldy #7
+.reverse_loop
+    lda (oswrch_v),y
+    eor #255
+    sta (oswrch_v),y
+    dey:bpl reverse_loop
+.not_reverse
+
+    \ V now points to the character bitmap; it's had all the relevant
+    \ attributes applied ready for writing to the screen, except
+    \ for double-width and double-width bold, which are handled by
+    \ direct_screen_write_simple.
+    jmp direct_screen_write_simple
+}
+
+
+\ Set V to point to the OS bitmap for the character in A; this will page ANDY in
+\ if required on a Master.
+.init_oswrch_v_to_read_only_os_bitmap
+{
+    tax
+    asl a:asl a:asl a:sta oswrch_vl \ character offset within page
+    txa
+    lsr a:lsr a:lsr a:lsr a:lsr a:tax \ high bits of character "address"
+
+    xassert_oswrch_ww_valid
+    ldy #host_flags_offset:lda (oswrch_ww),y
+    assert host_flag_master == 1<<0
+    lsr a:bcs bitmaps_in_andy
+
+    \ We're on a BBC B or B+; the bitmaps are either in the OS ROM or main RAM.
+    \ X is offset from bbc_b_font_location_table-1
+    lda font_explosion_mask_table-1,x:and bbc_b_font_explosion_flags:beq in_rom
+    \ This character is in RAM
+    lda bbc_b_font_location_table-1,x:sta oswrch_vh
+    rts
+.in_rom
+    \ We can't do 'ora #hi(bbc_b_bitmaps_base_0)' here because it doesn't
+    \ have the lower three bits zero.
+    txa:clc:adc #hi(bbc_b_bitmaps_base_0):sta oswrch_vh
+    rts
+
+.bitmaps_in_andy
+    \ Page in ANDY so we can access the character bitmap; the ROM number in the
+    \ OSWRCH shim already has the romsel_andy bit set.
+    lda oswrch_shim_ram_lda_our_bank+1:sta romsel_copy:sta romsel
+
+    txa
+    assert (hi(andy_bitmaps_base_0) and %00000111) == 0
+    ora #hi(andy_bitmaps_base_0):sta oswrch_vh
+
+    rts
+}
+
+
+\ Table used to double up pixels for double-width characters
+\        output      input
+.*double_width_table
+    equb %00000000 \ %00000000
+    equb %00000011 \ %00000001
+    equb %00001100 \ %00000010
+    equb %00001111 \ %00000011
+    equb %00110000 \ %00000100
+    equb %00110011 \ %00000101
+    equb %00111100 \ %00000110
+    equb %00111111 \ %00000111
+    equb %11000000 \ %00001000
+    equb %11000011 \ %00001001
+    equb %11001100 \ %00001010
+    equb %11001111 \ %00001011
+    equb %11110000 \ %00001100
+    equb %11110011 \ %00001101
+    equb %11111100 \ %00001110
+    equb %11111111 \ %00001111
+
+
+\ Table used for BBC B/B+ font explosion lookup; as the high 3 bits of a
+\ character code can't be 0, this starts at 1 and we make a corresponding
+\ adjustment when accessing it.
+.*font_explosion_mask_table
+    for i, 1, 7
+        equb 1 << (7 - i)
+    next
+xassert_table_on_one_page font_explosion_mask_table \ used in fast path
+
+
+\ Bitmaps for the "special characters and line drawing character set", from
+\ first_special_character_code+1 onwards.
+\
+\ Ordinary Acorn characters have their "don't join on to adjacent characters"
+\ space on the left (some have it on the right as well, but e.g. "w" has it
+\ on the left only), so we're consistent and do the same.
+
+.special_character_bitmaps
+\ blank                  95 &5f 0137
+\ The blank graphics character isn't included in special_character_bitmaps;
+\ encode_character encodes this as a regular space.
+
+\ diamond                96 &60 0140
+equb %00000000
+equb %00011000
+equb %00111100
+equb %01111110
+equb %00111100
+equb %00011000
+equb %00000000
+equb %00000000
+\ chequerboard           97 &61 0141
+equb %11001100
+equb %11001100
+equb %00110011
+equb %00110011
+equb %11001100
+equb %11001100
+equb %00110011
+equb %00110011
+\ HT                     98 &62 0142
+equb %01010000
+equb %01010000
+equb %01110000
+equb %01010111
+equb %01010010
+equb %00000010
+equb %00000010
+equb %00000010
+\ FF                     99 &63 0143
+equb %01110000
+equb %01000000
+equb %01110000
+equb %01000111
+equb %01000100
+equb %00000111
+equb %00000100
+equb %00000100
+\ CR                    100 &64 0144
+equb %01110000
+equb %01000000
+equb %01000000
+equb %01000110
+equb %01110101
+equb %00000110
+equb %00000101
+equb %00000101
+\ LF                    101 &65 0145
+equb %01000000
+equb %01000000
+equb %01000000
+equb %01000111
+equb %01110100
+equb %00000111
+equb %00000100
+equb %00000100
+\ degree                102 &66 0146
+equb %00111100
+equb %01100110
+equb %00111100
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+\ plus/minus            103 &67 0147
+equb %00011000
+equb %00011000
+equb %01111110
+equb %00011000
+equb %00011000
+equb %00000000
+equb %01111110
+equb %00000000
+\ NL                    104 &68 0150
+equb %01110000
+equb %01010000
+equb %01010000
+equb %01010100
+equb %01010100
+equb %00000100
+equb %00000100
+equb %00000111
+\ VT                    105 &69 0151
+equb %01010000
+equb %01010000
+equb %01010000
+equb %01010111
+equb %00100010
+equb %00000010
+equb %00000010
+equb %00000010
+\ bottom right box      106 &6a 0152
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011000
+equb %11111000
+equb %00000000
+equb %00000000
+equb %00000000
+\ top right box         107 &6b 0153
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %11111000
+equb %00011000
+equb %00011000
+equb %00011000
+\ top left box          108 &6c 0154
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00011111
+equb %00011000
+equb %00011000
+equb %00011000
+\ bottom left box       109 &6d 0155
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011111
+equb %00000000
+equb %00000000
+equb %00000000
+\ box intersection      110 &6e 0156
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011000
+equb %11111111
+equb %00011000
+equb %00011000
+equb %00011000
+\ line (scan 1)         111 &6f 0157
+equb %11111111
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+\ line (scan 3)         112 &70 0160
+equb %00000000
+equb %00000000
+equb %11111111
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+\ line (scan 5)         113 &71 0161
+\ This is the horizontal line character which joins up with the box drawing 
+\ characters.
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %11111111
+equb %00000000
+equb %00000000
+equb %00000000
+\ line (scan 7)         114 &72 0162
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %11111111
+equb %00000000
+\ line (scan 9)         115 &73 0163
+\ We can't actually do this properly, as we only have 8 lines per character.
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %11111111
+\ box right tee         116 &74 0164
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011111
+equb %00011000
+equb %00011000
+equb %00011000
+\ box left tee          117 &75 0165
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011000
+equb %11111000
+equb %00011000
+equb %00011000
+equb %00011000
+\ box up tee            118 &76 0166
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011000
+equb %11111111
+equb %00000000
+equb %00000000
+equb %00000000
+\ box down tee          119 &77 0167
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %11111111
+equb %00011000
+equb %00011000
+equb %00011000
+\ vertical line         120 &78 0168
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011000
+equb %00011000
+\ less than or equal    121 &79 0170
+equb %00000111
+equb %00011100
+equb %01110000
+equb %00011100
+equb %00000111
+equb %00000000
+equb %01111111
+equb %00000000
+\ greater than or equal 122 &7a 0171
+equb %01110000
+equb %00011100
+equb %00000111
+equb %00011100
+equb %01110000
+equb %00000000
+equb %01111111
+equb %00000000
+\ pi                    123 &7b 0172
+equb %00000000
+equb %00000000
+equb %01111111
+equb %00110110
+equb %00110110
+equb %00110110
+equb %00110110
+equb %00000000
+\ not equals            124 &7c 0173
+equb %00000110
+equb %00001100
+equb %01111110
+equb %00011000
+equb %01111110
+equb %00110000
+equb %01100000
+equb %00000000
+\ pound/backtick        125 &7d 0174
+\ This is where pound would logically appear, but encode_character arranges
+\ things so that this is where we store the backtick bitmap instead - we use
+\ the normal OS bitmap for the pound sign.
+equb %00110000
+equb %00011000
+equb %00001100
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+\ bullet                126 &7e 0175
+equb %00000000
+equb %00000000
+equb %00011000
+equb %00011000
+equb %00000000
+equb %00000000
+equb %00000000
+equb %00000000
+.special_character_bitmaps_end
+assert special_character_bitmaps_end - special_character_bitmaps == 31*8
+
+} \ close file scope

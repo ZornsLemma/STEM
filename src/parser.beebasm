@@ -1,0 +1,328 @@
+\ parser.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Command line parser
+
+\ The parser needs four bytes of zero page; we take the last four bytes of the
+\ eight byte workspace for transient commands. parser_command_y needs to be
+\ preserved between calls to parse_next_argument, the others can be re-used as
+\ scratch space but will be corrupted by calls to parse_next_argument.
+assert transient_zp == &a8
+parser_star_command = transient_zp+4 \ 1 byte
+parser_table_ptr    = transient_zp+5 \ 2 bytes
+parser_command_y    = transient_zp+7 \ 1 byte
+
+assert command_ptr == &f2
+assert gsinit == &ffc2
+assert gsread == &ffc5
+
+{ \ open file scope
+
+\ Command line parser; suitable for use with *HELP arguments, * commands and *
+\ command arguments. This routine takes a single argument from the input and
+\ tries to locate it in a table of valid keywords.
+\
+\ On entry:
+\
+\   command_ptr points to the command line to parse
+\
+\   parser_command_y (*not* the Y register) indicates the offset from
+\   command_ptr of the first character in the argument to process
+\
+\   A should be non-0 but with top and bottom bits clear if a * command is
+\   being parsed, 0 otherwise. This has two effects:
+\     - GSINIT/GSREAD are not used for * commands
+\     - * commands implicitly treat the table as though each entry were
+\       duplicated with a leading single character prefix
+\       (parser_star_command_optional_prefix), to help the user work around 
+\       clashes with other ROMs' * commands
+\
+\   YX points to a table of valid arguments. See below for a description of
+\   the table format.
+\
+\ On exit:
+\
+\   YX contains a 16-bit value indicating the result of the lookup on the input
+\   argument:
+\   - if there was no next argument in the input, YX=0, otherwise
+\   - if no match for the argument was found, YX=1, otherwise
+\   - if a match for the argument was found, YX is the corresponding handler 
+\     argument from the table (such a YX always has the top bit of Y set,
+\     because handler arguments in the table always do)
+\
+\   parser_command_y has been advanced to skip over the argument
+\
+\   command_ptr is preserved
+\
+\ The table of keywords to match has the following format:
+\   equs "KEYWORD1":xequw_be handler_argument
+\   equs "KEYWORD2 optional stuff ignored by parser":xequw_be handler_argument
+\   ...
+\   equb 0
+\
+\ The handler argument is a 16-bit big-endian value which must have its top
+\ bit set - this is used to recognise the end of the keyword string.
+\ 
+\ The keyword must be in upper case; the parser will convert arguments from
+\ the input to upper case for comparison. The keyword is terminated by either
+\ a top bit set byte or a space; the latter allows the keyword to be followed by
+\ optional text which the parser will ignore, which can be useful in allowing
+\ the * command table to serve double duty as the source of the *HELP output.
+.*parse_next_argument
+{
+    if debug
+    {
+        \ Check our slightly picky requirements on the initial value of A
+        \ have been met.
+        pha
+        and #%10000001
+        beq ok:cant_happen:.ok
+        pla        
+    }
+    endif
+
+    stx parser_table_ptr:sty parser_table_ptr+1
+    sta parser_star_command
+    lda parser_command_y:pha:tay \ initialise Y and save a copy for later
+
+    jsr my_gsinit:bne argument_found
+    ldx #0:xbeq_always rts_y_0 \ no argument, return with YX=0
+.argument_found
+
+    \ Compare the argument against each table entry in turn
+.table_entry_loop
+    ldy #0:lda (parser_table_ptr),y:beq no_match_found
+    pla:pha:tay \ peek saved Y
+    lda parser_table_ptr:pha
+    lda parser_table_ptr+1:pha
+    clc:jsr check_one_table_entry
+    txa:bne no_second_chance \ we matched so don't make a second prefix-using attempt
+    lda parser_star_command:beq no_second_chance \ prefix only relevant for * commands
+    pla:sta parser_table_ptr+1
+    pla:sta parser_table_ptr
+    pla:pha:tay \ peek saved Y
+    sec:jsr check_one_table_entry
+    pha:pha
+.no_second_chance
+    pla:pla
+    txa:bne match_found
+    clc:lda parser_table_ptr:adc #2:sta parser_table_ptr:bcc table_entry_loop
+    inc parser_table_ptr+1:xbne_always table_entry_loop
+
+.no_match_found
+    \ Skip over any remaining part of the argument in the input, so we're ready
+    \ to parse the next argument the next time we're called.
+    ldy parser_command_y
+.discard_loop
+    jsr my_gsread:bcc discard_loop
+    sty parser_command_y
+    \ No match found for argument, return with YX=1
+    ldx #1
+.rts_y_0
+    ldy #0
+    pla \ discard saved Y
+    rts
+
+.match_found
+    pla \ discard saved Y
+    \ Match found, return with YX=handler argument from table
+    ldy #1:lda (parser_table_ptr),y:tax
+    dey:lda (parser_table_ptr),y:tay
+    rts
+}
+
+
+\ Compare the argument at input_keyword_start_y against the table entry pointed
+\ to by parser_table_ptr.
+\
+\ On entry:
+\
+\   C set => implicitly add parser_star_command_optional_prefix to the front of
+\   the keyword in the table
+\
+\   Y contains the offset of the start of the current argument within 
+\   command_ptr
+\
+\ On exit:
+\
+\   X=0 if the argument didn't match the table entry, 1 if it did
+\
+\   parser_command_y contains the offset within the command line "as far as we
+\   parsed" the argument; the exact value isn't terribly interesting if X=0, but
+\   if X=1 parser_command_y is positioned ready to parse the following argument
+\
+\   parser_table_ptr has been advanced to the handler for the table entry just
+\   checked
+.check_one_table_entry
+{
+    php
+
+    \ This call to my_gsinit can't fail; our caller did the same and succeeded.
+    jsr my_gsinit
+
+    plp:bcc no_prefix_check
+    jsr my_gsread \ can't fail - we just called my_gsinit and it succeeded
+    jsr a_to_upper
+    cmp #parser_star_command_optional_prefix:bne no_match
+.no_prefix_check
+
+.argument_loop
+    jsr my_gsread:bcc character_read
+    \ We're at the end of the argument, so this is a match iff we're also at the
+    \ end of the table keyword.
+    jsr check_for_end_of_table_keyword
+    jmp argument_loop_done
+.character_read
+    cmp #'.':bne not_abbreviation
+    \ We've seen ".", so this is a match as long as there's at least one more
+    \ character in the keyword in the table. ("FO." matches "FOO" but "FOO."
+    \ doesn't match "FOO")
+    jsr check_for_end_of_table_keyword
+    txa:bne no_match
+    \ There is at least one more character in the keyword in the table. Before
+    \ we declare this a match, check there are no more characters in the
+    \ argument. (This is not just pedantic; if the argument is quoted we must do
+    \ this to consume the trailing quote and leave parser_command_y in the right
+    \ place for the next argument.)
+    jsr my_gsread:bcc no_match
+    ldx #1:xbne_always argument_loop_done
+.not_abbreviation
+    jsr a_to_upper
+    \ We have a character of the argument to process, so if we're at the end of
+    \ the table keyword this isn't a match.
+    pha:jsr check_for_end_of_table_keyword:pla
+    cpx #1:beq no_match
+    \ X=0 as we didn't just branch
+    cmp (parser_table_ptr,x):bne no_match \ argument and table keyword differ
+    inc parser_table_ptr:bne argument_loop
+    inc parser_table_ptr+1:xbne_always argument_loop
+.no_match
+    ldx #0
+.argument_loop_done
+
+    sty parser_command_y
+
+    \ Skip over any left-over part of the table entry to hit the handler
+    \ argument; if we just had a match we need to do this to access the handler
+    \ argument, and if we didn't match we need to do this so we can advance to
+    \ the start of the next table entry.
+    ldy #0
+.advance_to_handler_loop
+    lda (parser_table_ptr),y:bmi found_handler
+    inc parser_table_ptr:bne advance_to_handler_loop
+    inc parser_table_ptr+1:xbne_always advance_to_handler_loop
+.found_handler
+
+    rts
+}
+
+
+\ Check to see if (parser_table_ptr) is a keyword terminator; that is, either
+\ the top bit set byte indicating the first byte of the handler or a space
+\ (indicating the keyword has some following text which the parser should
+\ ignore).
+\
+\ On exit:
+\   X=1 if (parser_table_ptr) is a keyword terminator, 0 otherwise
+\   Y preserved
+.check_for_end_of_table_keyword
+{
+    ldx #0:lda (parser_table_ptr,x)
+    bmi at_end
+    cmp #(' '+1):bcs check_for_end_of_table_keyword_rts
+.at_end
+    inx \ X=1
+.^check_for_end_of_table_keyword_rts
+    rts
+}
+
+
+\ Prepare to read an argument from (command_ptr),Y. For * commands this is
+\ mostly a no-op, otherwise we invoke the real GSINIT (which mustn't be used
+\ for * commands). Our API is a bit simpler, however.
+\
+\ On entry:
+\
+\   C is *not* relevant (unlike real GSINIT)
+\
+\   (command_ptr),Y points to "near" the start of the argument
+\
+\ On exit:
+\
+\   Z is set if there is no argument, clear otherwise
+\
+\   Y has been advanced ready for a subsequent call to my_gsread to return the
+\   first character of the argument (provided Z is clear)
+\
+\   A is undefined (unlike real GSINIT; call my_gsread to get the first character)
+.my_gsinit
+{
+    \ In the * command case we don't really need to do anything; the OS will
+    \ have positioned Y at the start of the command. Z is already clear when we
+    \ return since we've just taken a bne branch.
+    lda parser_star_command:bne check_for_end_of_table_keyword_rts
+    clc:jmp gsinit 
+}
+
+
+\ Read a character from the argument at (command_ptr),Y. For * commands
+\ this is a direct implementation, otherwise we invoke the real GSREAD
+\ (which mustn't be used for * commands). It's safe to call this again once it's
+\ returned with C set; it will continue to return with C set indefinitely.
+\
+\ On entry:
+\   (command_ptr),Y points to "next" character to read
+\
+\ On exit:
+\   C is set iff the end of the argument was reached
+\   A is the character read (if C is clear)
+\   Y has been advanced as appropriate
+\   X is preserved
+.my_gsread
+{
+    lda parser_star_command:beq use_real_gsread
+    \ We somewhat arbitrarily consider any character < '.' to be a terminator;
+    \ this includes CR, space and '"', allowing quoted arguments to immediately
+    \ follow a * command without an intervening space. Note that we leave Y
+    \ alone if we decide we've hit one of these terminators, so any subsequent
+    \ call to my_gsread will indicate end of string as well. We don't consider
+    \ '.' itself to be a terminator, but after we return it we set b7 of
+    \ parser_star_command to indicate that future calls should indicate end of
+    \ argument; this is necessary to allow arguments to an abbreviated * command
+    \ to immediately follow the '.'.
+    asl a:bcs rts \ if we've signalled end of argument once, keep doing so
+    lda #'.':cmp (command_ptr),y
+    bcc not_full_stop_or_terminator
+    bne rts \ seen terminator; no need to set b7 of parser_star_command
+    \ It's a '.'.
+    ror parser_star_command \ C is set so this sets b7, we don't care about b0-6
+    xclc \ we required b0 of original parser_star_command to be clear
+.not_full_stop_or_terminator
+    lda (command_ptr),y
+    iny
+.rts
+    rts
+.use_real_gsread
+    jmp gsread
+}
+
+
+\ Convert A from lower case to upper case, leaving it alone if it's not lower
+\ case.
+\
+\ Preserves: X, Y
+.*a_to_upper
+{
+    cmp #'a':bcc rts
+    cmp #('z'+1):bcs rts
+    and #%11011111
+.rts
+    rts
+}
+
+} \ close file scope

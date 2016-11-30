@@ -1,0 +1,1132 @@
+\ buffer.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ INSV/REMV/CNPV handlers; used to translate OS keycodes into suitable
+\ VT102/VT52-style keycodes as appropriate. This also relocates the
+\ keyboard buffer from main RAM into our workspace, which is easier for us
+\ to work with and free up the memory allocated for the OS keyboard buffer
+\ for oswrch_shim_ram.
+
+{ \ open file scope
+
+\ We're very short on zero page workspace here. We have three bytes at
+\ buffer_zp which we can corrupt as long as interrupts are disabled. They
+\ would just about be enough, but it would be painful to make do with
+\ only them. We therefore save the two bytes at oswrch_w on the stack once
+\ we've disabled interrupts and restore them before we return to our caller
+\ or chain on to the parent handler. This gives us a bit more breathing room
+\ and allows code which needs oswrch_ww to be initialised to be shared between
+\ these handlers and the main OSWRCH code.
+
+
+\ We use DEY/INY to change between these two offsets in this code.
+assert input_buffer_normal_free_offset + 1 == input_buffer_priority_free_offset
+
+
+\ Push the two bytes at oswrch_w onto the stack.
+\
+\ On exit:
+\   A is corrupted
+\   X and Y are preserved
+\   V and C flags are preserved
+macro push_oswrch_w
+    lda oswrch_w:pha
+    lda oswrch_w+1:pha
+endmacro
+
+
+\ Pull two bytes from the stack and store at oswrch_w.
+\
+\ On exit:
+\   A is corrupted
+\   X and Y are preserved
+\   V and C flags are preserved
+macro pull_oswrch_w
+    pla:sta oswrch_w+1
+    pla:sta oswrch_w
+endmacro
+
+
+\ State flags used with key_translation_table. There is a copy of these
+\ constants in make-table.py; the two must be kept in sync.
+state_uk                        = 1<<0
+state_keypad_emulation          = 1<<1
+state_application_keypad_mode   = 1<<2
+assert keyboard_status_shift   == 1<<3
+assert keyboard_status_ctrl    == 1<<6
+state_shift                     = keyboard_status_shift
+state_ctrl                      = keyboard_status_ctrl
+
+
+\ TODO: It might be nice if there was a way to generate an Acorn escape
+\ event from the keyboard when the emulation is on, e.g. by pressing
+\ CTRL-SHIFT-ESCAPE. This would avoid things like getting trapped in AUTO mode
+\ if using the emulation in a normal Acorn environment. However, it's not clear
+\ to me how I can safely and correctly do this from within the INSV handler.
+
+
+\ Keycodes seen by INSV for various hardware keys, given the settings we install
+\ in set_our_keyboard_settings.
+acorn_key_ctrl_underscore  = 31
+acorn_key_pound            = 96
+acorn_key_f0               = 128
+acorn_key_f1               = 129
+acorn_key_f2               = 130
+acorn_key_f3               = 131
+acorn_key_f4               = 132
+acorn_key_f5               = 133
+acorn_key_f7               = 135
+acorn_key_f8               = 136
+acorn_key_shift_f0         = 144
+acorn_key_shift_f9         = 153
+acorn_key_ctrl_f0          = 160
+acorn_key_copy             = 139
+acorn_key_left             = 140
+acorn_key_right            = 141
+acorn_key_down             = 142
+acorn_key_up               = 143
+acorn_key_keypad_plus      = acorn_key_keypad_base - 5
+acorn_key_keypad_minus     = acorn_key_keypad_base - 3
+acorn_key_keypad_slash     = acorn_key_keypad_base - 1
+acorn_key_keypad_asterisk  = acorn_key_keypad_base - 6
+acorn_key_keypad_7         = acorn_key_keypad_base + 7
+acorn_key_keypad_8         = acorn_key_keypad_base + 8
+acorn_key_keypad_9         = acorn_key_keypad_base + 9
+acorn_key_keypad_hash      = acorn_key_keypad_base - 13
+acorn_key_keypad_4         = acorn_key_keypad_base + 4
+acorn_key_keypad_5         = acorn_key_keypad_base + 5
+acorn_key_keypad_6         = acorn_key_keypad_base + 6
+acorn_key_keypad_delete    = acorn_key_keypad_base + 79
+acorn_key_keypad_1         = acorn_key_keypad_base + 1
+acorn_key_keypad_2         = acorn_key_keypad_base + 2
+acorn_key_keypad_3         = acorn_key_keypad_base + 3
+acorn_key_keypad_comma     = acorn_key_keypad_base - 4
+acorn_key_keypad_0         = acorn_key_keypad_base + 0
+acorn_key_keypad_full_stop = acorn_key_keypad_base - 2
+acorn_key_keypad_enter     = acorn_key_keypad_base - 35
+assert acorn_key_keypad_hash == acorn_key_ctrl_f0 \ clash, we work around this
+
+
+\ Keycodes generated internally but treated similarly to values supplied
+\ to INSV by the OS; these values are therefore arbitrary, but they mustn't
+\ clash with any Acorn keys. They don't have to be consecutive, it's just easy
+\ to make them so. (We can't conveniently use the fact they are consecutive
+\ to index into any tables, as the tables in question have variable-length
+\ entries.)
+vt102_internal_keypad_base      = 238
+vt102_internal_keypad_0         = vt102_internal_keypad_base
+vt102_internal_keypad_1         = vt102_internal_keypad_base + 1
+vt102_internal_keypad_2         = vt102_internal_keypad_base + 2
+vt102_internal_keypad_3         = vt102_internal_keypad_base + 3
+vt102_internal_keypad_4         = vt102_internal_keypad_base + 4
+vt102_internal_keypad_5         = vt102_internal_keypad_base + 5
+vt102_internal_keypad_6         = vt102_internal_keypad_base + 6
+vt102_internal_keypad_7         = vt102_internal_keypad_base + 7
+vt102_internal_keypad_8         = vt102_internal_keypad_base + 8
+vt102_internal_keypad_9         = vt102_internal_keypad_base + 9
+vt102_internal_keypad_minus     = vt102_internal_keypad_base + 10
+vt102_internal_keypad_comma     = vt102_internal_keypad_base + 11
+vt102_internal_keypad_full_stop = vt102_internal_keypad_base + 12
+vt102_internal_keypad_enter     = vt102_internal_keypad_base + 13
+vt102_internal_keypad_pf1       = vt102_internal_keypad_base + 14
+vt102_internal_keypad_pf2       = vt102_internal_keypad_base + 15
+vt102_internal_keypad_pf3       = vt102_internal_keypad_base + 16
+vt102_internal_keypad_pf4       = vt102_internal_keypad_base + 17
+
+
+\ Codes generated by the emulated VT102 keyboard.
+ctrl_space    = 0
+backspace     = 8
+line_feed     = 10
+ctrl_backtick = 30
+ctrl_slash    = 31
+
+
+\ All of our buffer handlers need to do a little dance in order to pass a
+\ call through to their parent handler. We need to extract the parent address
+\ from our workspace, and 'insert' it onto the stack underneath the stacked
+\ flags so that we can transfer control via RTI. (We could also transfer
+\ control via PLP:RTS if we stacked the address minus 1, but we might as well
+\ use RTI.) We can't transfer control by putting the address at buffer_zp
+\ and doing JMP (buffer_zp) as we'd need to PLP first which would typically
+\ re-enable interrupts and make buffer_zp vulnerable to corruption. We have to
+\ restore oswrch_w to its stacked value as well before re-enabling interrupts,
+\ so we can't use that for an indirect JMP either.
+\
+\ On entry:
+\   oswrch_w points to our workspace
+\
+\   stack looks like: original flags (1 byte)
+\                     junk (discard_count bytes)
+\                     original_value of oswrch_w (2 bytes)
+\                     (next free location)
+\ 
+\ On exit:
+\   stack looks like: high byte of parent handler (*not* parent handler-1)
+\                     low byte of parent handler (*not* parent handler-1)
+\                     original flags (1 byte)
+\                     (next free location)
+\
+\   i.e. an RTI instruction will restore the flags and transfer control to the
+\   parent handler.
+\
+\   X is preserved
+\   buffer_zp+2 is preserved
+\
+\   A and Y are corrupted
+\   buffer_zp and buffer_zp+1 are corrupted
+\
+\   oswrch_w and oswrch_w+1 are restored to their original values from the stack
+\   on entry.
+macro prepare_for_rti_to_parent_handler parent_offset, discard_count
+    xassert_oswrch_ww_valid
+
+    ldy #parent_offset:lda (oswrch_ww),y:sta buffer_zp \ low byte of parent handler
+    iny:lda (oswrch_ww),y:tay \ high byte of parent handler
+
+    pull_oswrch_w
+
+    if discard_count > 0
+        for i, 1, discard_count
+            pla
+        next
+    endif
+
+    pla:sta buffer_zp+1 \ unstack flags and stash in buffer_zp+1
+
+    \ The stack is now in the state the parent handler wants to see it in; we've
+    \ removed everything we had stacked and restored oswrch_w to the value it
+    \ had originally.
+
+    tya:pha \ high byte of parent handler
+    lda buffer_zp:pha \ low byte of parent handler
+    lda buffer_zp+1:pha \ flags
+    \ stack is now set up for caller to do RTI
+endmacro
+
+
+\ Our INSV handler (starting at our_buffer_insert)
+\
+\ We forward non-keyboard buffer requests to the parent INSV handler. 
+\
+\ Keyboard buffer insertions are transformed from Acorn to VTxx-style codes
+\ (depending on the current terminal settings) and inserted into our own
+\ keyboard buffer; the parent INSV handler is not called.
+\
+\ On entry:
+\   A is the character to be inserted
+\   X is the buffer number to insert it in
+\
+\ On exit:
+\   A and X are preserved
+\   Y is corrupted
+\   C is set iff insertion failed (i.e. buffer full)
+{
+    \ buffer_zp+2 is used mostly to hold the original value of A or a modified
+    \ version of it, but it is sometimes repurposed so we don't give it a more
+    \ descriptive label. buffer_zp+0/1 are often free but are used inside
+    \ apply_map, for example.
+
+.pass_through
+    prepare_for_rti_to_parent_handler old_insv_offset, 1 \ 1 = discard stacked A
+    lda buffer_zp+2
+    rti
+
+.no_scroll
+    ldy #no_scroll_offset
+.toggle_flag_y
+    \ Toggle the flag. It lives in its own separate byte so that
+    \ this code (called in an interrupt handler) can't trample on other flags
+    \ being manipulated by the main "thread", and vice versa.
+    \ TODO: It might be nice if we made a discreet bleep when doing this. I
+    \ thought this wasn't possible, but AUG p252 says (under OSWORD &C, but it
+    \ seems a general comment) that OSWORD *is* OK from interrupt routines, so
+    \ using OSWORD 7 to make a beep might be OK - would need to research this a
+    \ little bit. It should probably be user configurable too.
+    lda (oswrch_ww),y
+    eor #1:sta (oswrch_ww),y
+    \ We don't actually insert the key into the buffer as we've already
+    \ processed it, but we tell our caller we have.
+    jmp discard
+
+.keypad_emulation_toggle
+    assert keypad_emulation_offset != 0
+    ldy #keypad_emulation_offset:xbne_always toggle_flag_y
+
+.*our_buffer_insert
+    \ We stack the flags with C clear to indicate successful insertion to our
+    \ caller when we restore them. We will update the stacked flags to have C
+    \ set if the insertion fails.
+    clc
+
+    php:sei
+
+    sta buffer_zp+2
+    pha \ stack original A
+    push_oswrch_w
+
+    jsr init_oswrch_ww_vectors_claimed
+
+    \ If this isn't an insert into the keyboard buffer, we just pass it
+    \ through to the parent handler. (We couldn't check for this earlier,
+    \ because we need access to our workspace to get the address of the parent
+    \ handler.)
+    assert keyboard_buffer_number == 0
+    txa:bne pass_through
+    sta buffer_zp \ zero this for use below
+
+    \ If we are disabled due to being in an unsupported mode, we shouldn't do
+    \ anything fancy, just insert the character into the buffer. If we're
+    \ disabled for any other reason, we perform our usual processing -
+    \ the other forms of being disabled are "temporary escapes" into using the
+    \ Acorn VDU driver, and we don't want the running application to see a
+    \ strange mix of Acorn and VT102 input depending on the mode when the
+    \ user pressed each key.
+    ldy #emulation_disabled_offset:lda (oswrch_ww),y
+    assert emulation_disabled_unsupported_mode == 1<<0
+    lsr a:bcs insert
+
+    \ Recognise some of our function keys.
+    lda buffer_zp+2
+    cmp #acorn_key_f8:beq no_scroll
+    cmp #acorn_key_f7:beq keypad_emulation_toggle
+
+    \ TODO: A 'HERE IS' key? See comment above control_character_jump_table in
+    \ oswrch.beebasm.
+
+    \ We perform an initial transformation on the keycode inserted by the OS
+    \ driver; this takes care of all the single character codes. We need to
+    \ set up a state flags byte as an input to the transformation; we build
+    \ this up in buffer_zp, which was zeroed above.
+
+    \ Check for application keypad mode
+    assert state_application_keypad_mode == 1<<2
+    ldy #vt102_flags_offset:lda (oswrch_ww),y:and #vt102_flag_keypad_mode
+    cmp #1 \ set C iff A >= 1, i.e. is non-0
+    rol buffer_zp
+    
+    \ Check for keypad emulation mode
+    assert state_keypad_emulation == 1<<1
+    ldy #keypad_emulation_offset:lda (oswrch_ww),y
+    cmp #1 \ set C iff A >= 1, i.e. is non-0
+    rol buffer_zp
+
+    \ Check for UK character set
+    assert state_uk == 1<<0
+    ldy #current_character_set_pointer_offset:lda (oswrch_ww),y
+    clc:adc #character_set_pointers_offset:tay:lda (oswrch_ww),y
+    \ Set C iff A >= character_set_uk; we arranged in constants.beebasm for this
+    \ to be the highest character_set_* constant.
+    cmp #character_set_uk
+    rol buffer_zp
+
+    \ Check SHIFT/CTRL status
+    assert state_shift == keyboard_status_shift
+    assert state_ctrl == keyboard_status_ctrl
+    lda keyboard_status:and #(keyboard_status_ctrl or keyboard_status_shift)
+    ora buffer_zp:sta buffer_zp
+
+    \ Now do the transformation on buffer_zp+2 using key_translation_table. We
+    \ iterate through the table from the start; the order matters because of
+    \ keycode clashes (for example, acorn_key_ctrl_f0 and acorn_key_keypad_hash
+    \ are the same; we disambiguate this by using an early table entry to
+    \ change the former to something else if CTRL is pressed).
+{
+    ldx #(-3 and &ff):xbne_always next_entry
+.loop
+    \ Is this entry for our keycode?
+    cmp key_translation_table+1,x:bne next_entry_a_populated
+    \ Yes. Is this entry compatible with the current state in state_flags?
+    \ We match if (state_flags and state_flags_mask)==state_flags_required.
+    \ state_flags_mask and state_flags_required are not stored directly in
+    \ key_translation_table; instead we store an offset into
+    \ state_mask_table, which reduces the size of each entry by one
+    \ byte.
+    lda buffer_zp \ A=state_flags
+    ldy key_translation_table,x
+    and state_mask_table,y
+    ora #top_bit \ see comment on state_mask_table in make-table.py
+    cmp state_mask_table+1,y
+    beq match
+.next_entry
+    lda buffer_zp+2:jsr a_to_upper
+.next_entry_a_populated
+    inx:inx:inx
+    cpx #key_translation_table_size:bne loop
+    xbeq_always key_translation_done
+.match
+    \ We've found a match. Turn buffer_zp+2 into the specified value.
+    lda key_translation_table+2,x:sta buffer_zp+2
+.key_translation_done
+}
+
+    \ Handle cursor keys
+    ldy #cursor_key_map_offset
+    ldx #cursor_key_map_size
+    jsr apply_map \ won't return if match found in map
+
+    \ Handle keypad keys
+    ldy #keypad_key_map_offset
+    ldx #keypad_key_map_size
+    jsr apply_map \ won't return if match found in map
+
+    \ Let's now discard anything >=128 except for the SHIFT-function key codes.
+    \ This prevents keys not used by the emulation from having odd effects;
+    \ this seems a good idea anyway, but also leaves them free for possible
+    \ future expansion rather than anyone relying on what happens if you
+    \ press (say) CTRL-SHIFT-f7.
+    lda buffer_zp+2:bpl not_high_keycode
+    cmp #acorn_key_shift_f0:bcc discard
+    cmp #acorn_key_shift_f9+1:bcs discard
+.not_high_keycode
+
+.insert
+    \ Insert buffer_zp+2 into the input buffer, provided there's space. This is
+    \ ordinary keyboard input, so we need normal space available - the priority
+    \ space is off limits.
+    ldy #input_buffer_normal_free_offset:lda (oswrch_ww),y
+    beq our_buffer_insert_input_buffer_full
+    lda buffer_zp+2:jsr insert_a_in_input_buffer_with_cr_translation
+
+.discard
+.^our_buffer_insert_return_to_caller_unstack
+    \ Restore everything and return to caller
+    pull_oswrch_w
+    ldx #keyboard_buffer_number
+    pla
+    plp
+    rts
+
+.^our_buffer_insert_input_buffer_full
+    \ Set C in the stacked flags to indicate the buffer is full to our caller.
+    tsx:lda stack+4,x:ora #flag_c_bit:sta stack+4,x
+    xbne_always our_buffer_insert_return_to_caller_unstack
+}
+
+
+\ Look up buffer_zp+2 in a map. If a match is found, insert the corresponding
+\ bytes into the input buffer and return from the INSV handler without returning
+\ to the caller. Return to the caller if a match is not found.
+\
+\ On entry:
+\   oswrch_ww points to our workspace
+\   buffer_zp+2 is the byte to look up
+\   Y points to the offset within our workspace of the map to use (this will
+\   be cursor_key_map_offset or keypad_key_map_offset)
+\   X is the number of entries in the map
+\
+\ On exit (only if no match found):
+\   buffer_zp and buffer_zp+1 are corrupted
+\   buffer_zp+2 and oswrch_ww are preserved
+.apply_map
+{
+    xassert_oswrch_ww_valid
+
+    \ Get the address of the map from (oswrch_ww),y and put it in buffer_zp
+    lda (oswrch_ww),y:sta buffer_zp
+    iny:lda (oswrch_ww),y:sta buffer_zp+1
+
+    ldy #0
+.find_loop
+    lda (buffer_zp),y
+    cmp buffer_zp+2:beq match_found
+.skip_entry
+    iny
+    lda (buffer_zp),y:bpl skip_entry
+    iny
+    dex:bne find_loop
+    \ We've processed the entire table without finding a match.
+    rts
+
+.match_found
+    \ We've found a match; whatever happens we won't be returning to our caller,
+    \ so discard the two bytes pushed onto the stack by their JSR to us.
+    pla:pla
+
+    \ Y currently points to the byte in the table we matched; the corresponding
+    \ escape sequence starts at Y+1.
+    sty buffer_zp+2
+
+    \ Is there enough space in the buffer for this escape sequence? We
+    \ require at least one byte of normal space to be available, but we
+    \ allow any extra bytes to come from priority space if necessary. This
+    \ means that if there are two bytes free in the normal space and the user
+    \ presses "A, cursor-up, B", we will insert "A, cursor-up" and discard "B"
+    \ instead of inserting "A, B". In practice this isn't a huge deal (the
+    \ same effect can result if the user presses A and the buffer fills,
+    \ the user presses cursor-up and it is discarded as the buffer is full,
+    \ the application consumes a byte and the user presses B and this goes
+    \ into the buffer) but it seems nice to try to maintain ordering like this.
+    ldy #input_buffer_normal_free_offset:lda (oswrch_ww),y
+    beq our_buffer_insert_input_buffer_full
+    \ There's at least one byte of normal space free, so we're now OK to use
+    \ priority space if required. Because we always use normal space first and
+    \ always return space to priority space first, the fact that there's one
+    \ byte of normal space free means all the priority space is free, so we
+    \ don't need any additional check.
+
+    \ Insert the escape sequence.
+.insert_loop
+    inc buffer_zp+2:ldy buffer_zp+2
+    lda (buffer_zp),y:pha \ get byte to insert from map
+    xand_not top_bit
+    jsr insert_a_in_input_buffer_with_cr_translation \ insert the byte
+    pla:bpl insert_loop
+    xbmi_always our_buffer_insert_return_to_caller_unstack
+}
+
+
+\ Increment an offset into our workspace in A by 1, wrapping around to the start
+\ of input_buffer if it would fall off the end.
+\
+\ On entry:
+\   A is the initial offset
+\
+\ On exit:
+\   A is the incremented offset
+\   X and Y are preserved
+.advance_input_buffer_ptr_in_a_with_wrapping
+{
+    clc:adc #1
+    cmp #(input_buffer_offset + input_buffer_total_size):bcc no_wrap
+    lda #input_buffer_offset
+.no_wrap
+    rts
+}
+
+
+\ Our REMV handler
+\
+\ We forward non-keyboard buffer requests to the parent REMV handler.
+\
+\ Keyboard buffer removals are satisfied from our own buffer; the parent REMV
+\ handler is not called.
+\
+\ On entry:
+\   X is buffer number to remove from
+\   V is clear to remove next character, V is set to examine next character
+\
+\ On exit:
+\   X is preserved
+\   C is set iff buffer was empty
+\   If C is clear: if V clear on entry (remove)    if V set on entry (examine)
+\                  A is undefined                  A is next character
+\                  Y is removed character          Y is undefined
+.*our_buffer_remove
+{
+    php:sei
+
+    push_oswrch_w
+    jsr init_oswrch_ww_vectors_claimed
+
+    assert keyboard_buffer_number == 0
+    txa:bne pass_through
+
+    \ Because we always use normal space preferentially for insertions and
+    \ return to priority space preferentially on removals, the buffer is
+    \ empty iff the normal space is empty.
+    ldy #input_buffer_normal_free_offset:lda (oswrch_ww),y
+    cmp #input_buffer_normal_size:bne buffer_not_empty
+    pull_oswrch_w
+    plp
+    sec \ indicate buffer empty to caller
+    rts
+
+.buffer_not_empty
+    \ Get the character from our buffer into A
+    ldy #input_buffer_front_offset:lda (oswrch_ww),y
+    tay:lda (oswrch_ww),y
+    \ Is the caller just examining the first byte or removing it?
+    bvs examination_only
+    \ The caller wants us to remove the byte as well as return it. We
+    \ increment the priority free count if it's less than the priority size,
+    \ otherwise we increment the normal free count - this means that space
+    \ gets returned to the priority space first.
+    pha
+    ldy #input_buffer_front_offset:lda (oswrch_ww),y
+    jsr advance_input_buffer_ptr_in_a_with_wrapping
+    sta (oswrch_ww),y
+    ldy #input_buffer_priority_free_offset:lda (oswrch_ww),y
+    cmp #input_buffer_priority_size:bne increment_priority_free
+    dey:lda (oswrch_ww),y
+.increment_priority_free
+    clc:adc #1:sta (oswrch_ww),y
+    pla
+.examination_only
+    \ We return with the character in A and Y; this exceeds the requirements of
+    \ the API.
+    tay
+    pull_oswrch_w
+    tya
+    plp
+    clc \ buffer wasn't empty on entry
+    rts
+
+.pass_through
+    prepare_for_rti_to_parent_handler old_remv_offset, 0
+    rti
+}
+
+
+\ Our CNPV handler
+\
+\ We forward non-keyboard buffer requests to the parent CNPV handler.
+\
+\ Keyboard buffer requests are handled using our own buffer; the parent CNPV
+\ handler is not called.
+\
+\ On entry:
+\   X is the buffer number
+\   V set for purge, clear for count
+\   If V is clear:
+\     C is set to query free space
+\     C is clear to query used space
+\
+\ On exit:
+\   A is undefined
+\   V and C are preserved
+\
+\   For purge:
+\     X and Y are preserved
+\
+\   For count:
+\     YX is the 16-bit result
+.*our_buffer_count_purge
+{
+    php:sei
+
+    push_oswrch_w
+    jsr init_oswrch_ww_vectors_claimed
+
+    assert keyboard_buffer_number == 0
+    txa:bne pass_through
+
+    bvs purge
+
+    \ It's a count request. C set indicates the caller wants the space left,
+    \ C clear indicates the caller wants the space used.
+    \
+    \ TODO: Currently this reports the total space used/free, which may not
+    \ be ideal. For callers interested in determining "how much (if anything)
+    \ can I insert?", the normal space is really what's relevant. For callers
+    \ interested in determining "how much (if anything) can I read?", the
+    \ total space is more relevant. We could change which answer we give
+    \ depending on whether the caller wants space used or free, but that might
+    \ be confusing. Arguably we should bias this towards callers interested
+    \ in what they can read, as a foreground application has a reasonable
+    \ claim to be the only thing which is allowed to read, whereas most of
+    \ the time inserts can happen whenever the user presses a key and so the
+    \ application is less likely to get upset if it isn't actually able to
+    \ insert as much as the return value indicates. I suspect in practice this
+    \ isn't really used in any very sophisticated way with the keyboard buffer.
+    ldy #input_buffer_normal_free_offset
+    bcs count_space_free
+.count_space_used
+    lda #input_buffer_total_size
+    sec:sbc (oswrch_ww),y
+    iny
+    xsec \ A>=0 after SBC so carry remains set
+    sbc (oswrch_ww),y
+    xbcs_always count_common \ A>=0 after SBC so carry remains set
+.count_space_free
+    lda (oswrch_ww),y
+    iny:clc:adc (oswrch_ww),y
+.count_common
+    tax:ldy #0 \ return with count in YX
+.common_end
+    pull_oswrch_w
+    plp
+    rts
+
+.purge
+    sty buffer_zp+2
+    jsr flush_input_buffer 
+    ldy buffer_zp+2
+    ldx #keyboard_buffer_number
+    assert keyboard_buffer_number == 0
+    xbeq_always common_end
+
+.pass_through
+    sty buffer_zp+2
+    prepare_for_rti_to_parent_handler old_cnpv_offset, 0
+    ldy buffer_zp+2
+    rti
+}
+
+
+\ Determine the number of free bytes in the input buffer available to a caller
+\ permitted to use the priority space, i.e. the total number of free normal and
+\ priority bytes.
+\
+\ We require that the caller has disabled interrupts; if this isn't the case,
+\ the value read might become immediate outdated and any decision the caller
+\ makes based on it could turn out to be wrong.
+\
+\ On entry:
+\   oswrch_ww points to our workspace
+\   interrupts are disabled
+\
+\ On exit:
+\   A and Y are corrupted
+\   X is preserved
+.*get_free_bytes_for_priority_in_input_buffer_in_a
+{
+    xassert_interrupts_disabled
+    xassert_oswrch_ww_valid
+    ldy #input_buffer_normal_free_offset:lda (oswrch_ww),y
+    iny:clc:adc (oswrch_ww),y
+    rts
+}
+
+
+\ Flush the keyboard input buffer
+\
+\ On entry:
+\   oswrch_ww points to our workspace
+\
+\ On exit:
+\   A and Y corrupted
+\   X is preserved
+.*flush_input_buffer
+{
+    xassert_oswrch_ww_valid
+    php:sei
+    lda #input_buffer_normal_size:ldy #input_buffer_normal_free_offset:sta (oswrch_ww),y
+    lda #input_buffer_priority_size:iny:sta (oswrch_ww),y
+    lda #input_buffer_offset
+    assert input_buffer_front_offset + 1 == input_buffer_back_offset
+    ldy #input_buffer_front_offset:sta (oswrch_ww),y
+    iny:sta (oswrch_ww),y
+    plp \ restore previous interrupt status
+    rts
+}
+
+
+\ Insert a fixed inline string into the input buffer in its entirety, or not at
+\ all if there isn't enough space. (It's obviously not ideal to insert nothing,
+\ but we have the priority space to reduce the chances of this happening, and
+\ it's much better to insert nothing than to insert a partial escape sequence.)
+\
+\ This operation is atomic. Control will not return to the caller, but to the
+\ caller's caller (as if via a "double RTS").
+\
+\ Invoke as:
+\   jsr insert_inline_string_in_input_buffer:equs "abcd", top_bit or 'e'
+.*insert_inline_string_in_input_buffer
+{
+    pla:sta oswrch_tl
+    pla:sta oswrch_th
+    \ oswrch_t points to one byte before the start of the string.
+
+    \ Disable interrupts
+    php:sei
+
+    \ Count the length of the string.
+    ldy #0
+.count_loop
+    iny:lda (oswrch_t),y
+    bpl count_loop
+    sty oswrch_ul
+
+    \ Is there room for the entire string in the input buffer?
+    jsr get_free_bytes_for_priority_in_input_buffer_in_a
+    cmp oswrch_ul:bcc done \ if not, return
+
+    \ Yes, there's room. Insert the string.
+    ldy #1:sty oswrch_uh
+.loop
+    ldy oswrch_uh
+    lda (oswrch_t),y
+    pha
+    xand_not top_bit:jsr insert_a_in_input_buffer
+    inc oswrch_uh
+    pla:bpl loop
+
+.done
+    \ Restore previous interrupt state
+    plp
+
+    rts
+}
+
+
+\ Insert a decimal string representation of A into the input buffer.
+\
+\ On entry:
+\   0 <= A <= 79
+\
+\   interrupts are disabled
+\
+\   oswrch_ww points to our workspace
+\
+\   caller has verified there is space in the buffer (either normal or
+\   priority space)
+.*insert_a_as_decimal_in_input_buffer
+{
+    xassert_interrupts_disabled
+
+    ldx #('0'-1)
+.loop
+    inx
+    sec:sbc #10
+    bpl loop
+.done_tens
+    pha
+    cpx #'0':beq first_digit_zero
+    txa:jsr insert_a_in_input_buffer
+.first_digit_zero
+    pla:clc:adc #('0'+10)
+    xbne_always insert_a_in_input_buffer
+}
+
+
+\ As insert_a_in_input_buffer but if the emulation is enabled, A is a CR (13)
+\ and linefeed/new line mode is set, actually insert CR LF. This uses an extra
+\ space in the buffer, but this is OK. As the second byte of an escape sequence
+\ representing a single keypress, it's correct for us to allow the use of
+\ priority space for the second byte. All callers of this routine check for at
+\ least one byte of normal space free first, and if that's true then the
+\ priority space is empty, so there's definitely space for the second byte.
+.insert_a_in_input_buffer_with_cr_translation
+{
+    pha
+    cmp #cr:bne no_translation
+    xassert_oswrch_ww_valid
+    ldy #emulation_disabled_offset:lda (oswrch_ww),y
+    assert emulation_disabled_unsupported_mode == 1<<0
+    lsr a:bcs no_translation
+    ldy #vt102_flags_offset:lda (oswrch_ww),y
+    assert vt102_flag_linefeed_new_line_mode == 1<<6
+    asl a:bpl no_translation
+    pla:jsr insert_a_in_input_buffer
+    lda #lf:pha
+.no_translation
+    pla
+    fall_through_to insert_a_in_input_buffer
+}
+
+
+\ Insert the byte in A into the input buffer, using priority space if
+\ necessary. (This subroutine is sometimes used by code which isn't entitled
+\ to use the priority space, but such code always checks to see there is
+\ normal space free first.)
+\
+\ On entry:
+\   A is the byte to insert
+\
+\   oswrch_ww points to our workspace
+\
+\   interrupts are disabled
+\
+\   caller has verified there is at least one byte free in the buffer
+\   (either normal or priority space)
+\
+\ On exit:
+\   A and X are preserved
+\   Y is corrupted
+.*insert_a_in_input_buffer
+{
+    xassert_oswrch_ww_valid
+    xassert_interrupts_disabled
+
+    pha
+
+    \ Decrement the free space count; we prefer to take normal space but we will
+    \ use priority space if necessary.
+    ldy #input_buffer_normal_free_offset:lda (oswrch_ww),y:bne using_normal
+    iny:lda (oswrch_ww),y
+    if debug
+    {
+        bne ok:cant_happen:.ok
+    }
+    endif
+.using_normal
+    sec:sbc #1:sta (oswrch_ww),y
+
+    \ Insert the A supplied by our caller at the back of the buffer
+    ldy #input_buffer_back_offset:lda (oswrch_ww),y
+    pha
+    jsr advance_input_buffer_ptr_in_a_with_wrapping
+    sta (oswrch_ww),y
+    pla:tay
+    pla:sta (oswrch_ww),y
+
+    rts
+}
+
+
+\ Key translation table for single keycode->single character mappings
+
+macro equk state_flags_mask, state_flags_required, input_code, output_code
+    \ In an ideal world we'd be able to build up state_mask_table
+    \ dynamically at assembly time. In this imperfect world we have built the
+    \ table up manually and we hard-code the (state_flags_mask,
+    \ state_flags_required) -> state_mask_table_offset lookup in this
+    \ macro.
+    if state_flags_mask == state_ctrl and state_flags_required == state_ctrl
+        equb 0
+    elif state_flags_mask == state_ctrl and state_flags_required == 0
+        equb 1
+    elif state_flags_mask == 0 and state_flags_required == 0
+        equb 2
+    elif state_flags_mask == state_uk and state_flags_required == state_uk
+        equb 4
+    elif state_flags_mask == state_keypad_emulation and state_flags_required == state_keypad_emulation
+        equb 6
+    elif state_flags_mask == (state_ctrl or state_application_keypad_mode) and state_flags_required == 0
+        equb 8
+    elif state_flags_mask == (state_ctrl or state_application_keypad_mode) and state_flags_required == state_application_keypad_mode
+        equb 10
+    else
+        error "Unsupported combination of state_flags_mask and state_flags_required"
+    endif
+    equb input_code, output_code
+endmacro
+
+\ Note that the OS driver *generally* generates different codes for keys
+\ depending on whether they are pressed in isolation or with CTRL/SHIFT,
+\ but sometimes it doesn't, which is why we have the ability to check these
+\ states explicitly in this table.
+.key_translation_table
+{
+    \ Short names for the state_* flags used only here where we're defining the
+    \ table.
+    s  = state_shift
+    c  = state_ctrl
+    uk = state_uk
+    k  = state_keypad_emulation
+    a  = state_application_keypad_mode
+
+    \ The OS driver doesn't generate control codes for CTRL-space and CTRL-/,
+    \ so we recognise them manually and generate the corresponding VT102 codes.
+    equk c, c, ' ', ctrl_space
+    equk c, c, '/', ctrl_slash
+
+    \ On a VT102, the pound and hash symbols are both on SHIFT-3 and share
+    \ the same code (35). SHIFT-3 on a BBC generates the same code, so that's
+    \ fine. However, we also have an actual £ key. If we're using the UK
+    \ character set, we turn it into 35 so it will display as a £ sign if
+    \ software echoes it. Otherwise we leave it alone and its code (96)
+    \ will be interpreted as a backtick in the DEC US character set - this
+    \ is fine, as there's no pound sign for it to generate - or a £ sign
+    \ in the Acorn US character set. To provide a way to enter a backtick,
+    \ we treat f0 as a backtick key (although this will of course enter a
+    \ £ sign in the Acorn US character set, where there is no backtick).
+    equk uk, uk, acorn_key_pound, vt102_uk_set_pound_code
+    equk 0,  0,  acorn_key_f0,    vt102_backtick_code
+
+    \ VT102 CTRL-` should generate code 30: 
+    \ - f0 acts as a backtick key for us, so CTRL-f0 should generate code 30;
+    \   unfortunately the OS driver code for this (acorn_key_ctrl_f0)
+    \   clashes with the code generated by the Master keypad hash key. (We
+    \   don't get much control over the codes generated by the Master keypad,
+    \   so we have to make the best of it.) We therefore recognise this code
+    \   and if CTRL is pressed we convert it. (This means that CTRL-keypad hash
+    \   also gets converted, but that's not the end of the world.)
+    equk c, c, acorn_key_ctrl_f0, ctrl_backtick
+    \ - the Acorn _ (unshifted)/£ (shifted) key acts as a kind of backtick
+    \   key, as noted above. There's no standard VT102 interpretation of
+    \   CTRL-_ so we just treat CTRL-(Acorn _/£) as CTRL-`. The OS driver
+    \   generates the same code for this with or without SHIFT being pressed.
+    equk c, c, acorn_key_ctrl_underscore, ctrl_backtick
+
+    equk 0, 0, acorn_key_copy, backspace
+
+    equk 0, 0, acorn_key_f5, line_feed
+
+    \ The DELETE key on the Master keypad has no equivalent on the VT102 keypad
+    \ so it is always treated the same as the regular DELETE key.
+    equk 0, 0, acorn_key_keypad_delete, del
+
+    \ f1-f4 always act as PF1-PF4
+    equk 0, 0, acorn_key_f1, vt102_internal_keypad_pf1
+    equk 0, 0, acorn_key_f2, vt102_internal_keypad_pf2
+    equk 0, 0, acorn_key_f3, vt102_internal_keypad_pf3
+    equk 0, 0, acorn_key_f4, vt102_internal_keypad_pf4
+
+    \ If keypad emulation is enabled, part of the main keyboard acts
+    \ as the VT102 keypad. TODO: Although the code which processes this
+    \ table converts letters to upper case before matching, it doesn't do
+    \ anything about other symbols. This means that - for example - with
+    \ keypad emulation on, SHIFT-'7' generates a single quote instead of '7'
+    \ and SHIFT-',' generates '<' not '0'. Arguably we should change this
+    \ - either by adding extra entries here, or (perhaps more compactly)
+    \ performing a pre-mapping which turns - to continue those examples -
+    \ single quote into '7' and '<' into ','.
+    equk k, k, '7', vt102_internal_keypad_7
+    equk k, k, '8', vt102_internal_keypad_8
+    equk k, k, '9', vt102_internal_keypad_9
+    equk k, k, '0', vt102_internal_keypad_minus
+    equk k, k, 'U', vt102_internal_keypad_4
+    equk k, k, 'I', vt102_internal_keypad_5
+    equk k, k, 'O', vt102_internal_keypad_6
+    equk k, k, 'P', vt102_internal_keypad_comma
+    equk k, k, 'J', vt102_internal_keypad_1
+    equk k, k, 'K', vt102_internal_keypad_2
+    equk k, k, 'L', vt102_internal_keypad_3
+    equk k, k, ';', vt102_internal_keypad_enter
+    equk k, k, 'M', vt102_internal_keypad_0
+    equk k, k, ',', vt102_internal_keypad_0
+    equk k, k, '.', vt102_internal_keypad_full_stop
+    equk k, k, '/', vt102_internal_keypad_enter
+
+    \ The following entries for the Master keypad all insist that CTRL is not
+    \ pressed. This is because our limited control over the keycodes handed to
+    \ us by the OS for the Master keypad means they can clash with the codes
+    \ generated by SHIFT/CTRL+function keys. By insisting that CTRL is not
+    \ pressed, we avoid these not-actually-keypad keypresses being interpreted
+    \ as keypad keypresses; the downside is that CTRL+keypad key does nothing,
+    \ but I don't think that's a big loss.
+
+    \ Some Master keypad keys match perfectly with the corresponding
+    \ physical keys on the VT102 keypad; we map these to the appropriate
+    \ vt102_internal_keypad_* codes all the time.
+    equk c, 0, acorn_key_keypad_7, vt102_internal_keypad_7
+    equk c, 0, acorn_key_keypad_8, vt102_internal_keypad_8
+    equk c, 0, acorn_key_keypad_9, vt102_internal_keypad_9
+    equk c, 0, acorn_key_keypad_4, vt102_internal_keypad_4
+    equk c, 0, acorn_key_keypad_5, vt102_internal_keypad_5
+    equk c, 0, acorn_key_keypad_6, vt102_internal_keypad_6
+    equk c, 0, acorn_key_keypad_1, vt102_internal_keypad_1
+    equk c, 0, acorn_key_keypad_2, vt102_internal_keypad_2
+    equk c, 0, acorn_key_keypad_3, vt102_internal_keypad_3
+    equk c, 0, acorn_key_keypad_0, vt102_internal_keypad_0
+    equk c, 0, acorn_key_keypad_full_stop, vt102_internal_keypad_full_stop
+    equk c, 0, acorn_key_keypad_enter, vt102_internal_keypad_enter
+
+    \ The rest of the Master keypad keys don't correspond with the VT102 layout.
+    \ If we're not in application keypad mode, they enter the characters shown
+    \ on their keycaps...
+    equk c or a, 0, acorn_key_keypad_plus,     '+'
+    equk c or a, 0, acorn_key_keypad_minus,    '-'
+    equk c or a, 0, acorn_key_keypad_slash,    '/'
+    equk c or a, 0, acorn_key_keypad_asterisk, '*'
+    equk c or a, 0, acorn_key_keypad_hash,     '#'
+    equk c or a, 0, acorn_key_keypad_comma,    ','
+    \ ... while if we're in application keypad mode, we map them to
+    \ vt102_internal_keypad_* codes based on their physical correspondence with
+    \ the VT102 keypad. (The VT102 keypad comma is in the same place as DELETE
+    \ on the Master keypad, but we map it to the nearby comma key on the Master
+    \ keypad.)
+    equk c or a, a, acorn_key_keypad_plus,     vt102_internal_keypad_pf1
+    equk c or a, a, acorn_key_keypad_minus,    vt102_internal_keypad_pf2
+    equk c or a, a, acorn_key_keypad_slash,    vt102_internal_keypad_pf3
+    equk c or a, a, acorn_key_keypad_asterisk, vt102_internal_keypad_pf4
+    equk c or a, a, acorn_key_keypad_hash,     vt102_internal_keypad_minus
+    equk c or a, a, acorn_key_keypad_comma,    vt102_internal_keypad_comma
+}
+key_translation_table_size = P% - key_translation_table
+
+
+\ Cursor key maps; these must all have the same size.
+
+cursor_key_map_size = 4
+
+\ Cursor key map for ANSI mode with Cursor Key Mode reset
+.*cursor_key_map_ansi_ckm_reset
+    equb acorn_key_left: equs escape, "[", top_bit or 'D'
+    equb acorn_key_right:equs escape, "[", top_bit or 'C'
+    equb acorn_key_down: equs escape, "[", top_bit or 'B'
+    equb acorn_key_up:   equs escape, "[", top_bit or 'A'
+
+\ Cursor key map for ANSI mode with Cursor Key Mode set
+.*cursor_key_map_ansi_ckm_set
+    equb acorn_key_left: equs escape, "O", top_bit or 'D'
+    equb acorn_key_right:equs escape, "O", top_bit or 'C'
+    equb acorn_key_down: equs escape, "O", top_bit or 'B'
+    equb acorn_key_up:   equs escape, "O", top_bit or 'A'
+
+\ Cursor key map for VT52 mode
+.*cursor_key_map_vt52
+    equb acorn_key_left: equs escape, top_bit or 'D'
+    equb acorn_key_right:equs escape, top_bit or 'C'
+    equb acorn_key_down: equs escape, top_bit or 'B'
+    equb acorn_key_up:   equs escape, top_bit or 'A'
+
+
+\ Keypad key maps; these must all have the same size.
+
+keypad_key_map_size = 18
+
+\ Keypad key maps for ANSI mode in Numeric Keypad Mode and Application Keypad
+\ Mode; the two maps interleave so we can share the common PF1-4 mappings.
+.*keypad_key_map_ansi_numeric_mode
+    equb vt102_internal_keypad_0:        equs top_bit or '0'
+    equb vt102_internal_keypad_1:        equs top_bit or '1'
+    equb vt102_internal_keypad_2:        equs top_bit or '2'
+    equb vt102_internal_keypad_3:        equs top_bit or '3'
+    equb vt102_internal_keypad_4:        equs top_bit or '4'
+    equb vt102_internal_keypad_5:        equs top_bit or '5'
+    equb vt102_internal_keypad_6:        equs top_bit or '6'
+    equb vt102_internal_keypad_7:        equs top_bit or '7'
+    equb vt102_internal_keypad_8:        equs top_bit or '8'
+    equb vt102_internal_keypad_9:        equs top_bit or '9'
+    equb vt102_internal_keypad_minus:    equs top_bit or '-'
+    equb vt102_internal_keypad_comma:    equs top_bit or ','
+    equb vt102_internal_keypad_full_stop:equs top_bit or '.'
+    equb vt102_internal_keypad_enter:    equs top_bit or 13
+.*keypad_key_map_ansi_application_mode
+    equb vt102_internal_keypad_pf1:      equs escape, "O", top_bit or 'P'
+    equb vt102_internal_keypad_pf2:      equs escape, "O", top_bit or 'Q'
+    equb vt102_internal_keypad_pf3:      equs escape, "O", top_bit or 'R'
+    equb vt102_internal_keypad_pf4:      equs escape, "O", top_bit or 'S'
+
+    equb vt102_internal_keypad_0:        equs escape, "O", top_bit or 'p'
+    equb vt102_internal_keypad_1:        equs escape, "O", top_bit or 'q'
+    equb vt102_internal_keypad_2:        equs escape, "O", top_bit or 'r'
+    equb vt102_internal_keypad_3:        equs escape, "O", top_bit or 's'
+    equb vt102_internal_keypad_4:        equs escape, "O", top_bit or 't'
+    equb vt102_internal_keypad_5:        equs escape, "O", top_bit or 'u'
+    equb vt102_internal_keypad_6:        equs escape, "O", top_bit or 'v'
+    equb vt102_internal_keypad_7:        equs escape, "O", top_bit or 'w'
+    equb vt102_internal_keypad_8:        equs escape, "O", top_bit or 'x'
+    equb vt102_internal_keypad_9:        equs escape, "O", top_bit or 'y'
+    equb vt102_internal_keypad_minus:    equs escape, "O", top_bit or 'm'
+    equb vt102_internal_keypad_comma:    equs escape, "O", top_bit or 'l'
+    equb vt102_internal_keypad_full_stop:equs escape, "O", top_bit or 'n'
+    equb vt102_internal_keypad_enter:    equs escape, "O", top_bit or 'M'
+
+\ Keypad key maps for VT52 mode in Numeric Keypad Mode and Application Keypad
+\ Mode; the two maps interleave so we can share the common PF1-4 mappings.
+.*keypad_key_map_vt52_numeric_mode
+    equb vt102_internal_keypad_0:        equs top_bit or '0'
+    equb vt102_internal_keypad_1:        equs top_bit or '1'
+    equb vt102_internal_keypad_2:        equs top_bit or '2'
+    equb vt102_internal_keypad_3:        equs top_bit or '3'
+    equb vt102_internal_keypad_4:        equs top_bit or '4'
+    equb vt102_internal_keypad_5:        equs top_bit or '5'
+    equb vt102_internal_keypad_6:        equs top_bit or '6'
+    equb vt102_internal_keypad_7:        equs top_bit or '7'
+    equb vt102_internal_keypad_8:        equs top_bit or '8'
+    equb vt102_internal_keypad_9:        equs top_bit or '9'
+    equb vt102_internal_keypad_minus:    equs top_bit or '-'
+    equb vt102_internal_keypad_comma:    equs top_bit or ','
+    equb vt102_internal_keypad_full_stop:equs top_bit or '.'
+    equb vt102_internal_keypad_enter:    equs top_bit or 13
+.*keypad_key_map_vt52_application_mode
+    equb vt102_internal_keypad_pf1:      equs escape, top_bit or 'P'
+    equb vt102_internal_keypad_pf2:      equs escape, top_bit or 'Q'
+    equb vt102_internal_keypad_pf3:      equs escape, top_bit or 'R'
+    equb vt102_internal_keypad_pf4:      equs escape, top_bit or 'S'
+
+    equb vt102_internal_keypad_0:        equs escape, "?", top_bit or 'p'
+    equb vt102_internal_keypad_1:        equs escape, "?", top_bit or 'q'
+    equb vt102_internal_keypad_2:        equs escape, "?", top_bit or 'r'
+    equb vt102_internal_keypad_3:        equs escape, "?", top_bit or 's'
+    equb vt102_internal_keypad_4:        equs escape, "?", top_bit or 't'
+    equb vt102_internal_keypad_5:        equs escape, "?", top_bit or 'u'
+    equb vt102_internal_keypad_6:        equs escape, "?", top_bit or 'v'
+    equb vt102_internal_keypad_7:        equs escape, "?", top_bit or 'w'
+    equb vt102_internal_keypad_8:        equs escape, "?", top_bit or 'x'
+    equb vt102_internal_keypad_9:        equs escape, "?", top_bit or 'y'
+    equb vt102_internal_keypad_minus:    equs escape, "?", top_bit or 'm'
+    equb vt102_internal_keypad_comma:    equs escape, "?", top_bit or 'l'
+    equb vt102_internal_keypad_full_stop:equs escape, "?", top_bit or 'n'
+    equb vt102_internal_keypad_enter:    equs escape, "?", top_bit or 'M'
+
+} \ close file scope

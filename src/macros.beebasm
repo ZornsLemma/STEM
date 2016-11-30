@@ -1,0 +1,213 @@
+\ macros.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Macro definitions; many of these start with 'x' to avoid BeebAsm's restriction
+\ on macro names starting with opcodes or assembler directives.
+
+\ Run time assertion that a certain point in the code is unreachable.
+macro cant_happen
+    if debug
+        \ This isn't ideal, as executing a brk tends to just result in a messy
+        \ crash, but the alternative would be to do something like jsr
+        \ cant_happen_subroutine and get clever pulling the address off the
+        \ stack and outputting it - all very well, but we'd then be spending
+        \ three bytes on a cant_happen and that's not good given the distance
+        \ restriction on relative branches.
+        brk
+    endif
+endmacro
+
+\ Sometimes we know the state of a flag and don't need to waste space/time
+\ setting or clearing it explicitly. These macros a) document where this
+\ is happening b) make it possible to assert at run time that the flag does
+\ have the expected value.
+macro xclc
+    if debug
+        bcc ok:cant_happen:.ok
+    endif
+endmacro
+macro xsec
+    if debug
+        bcs ok:cant_happen:.ok
+    endif
+endmacro
+
+\ Sometimes we can save code size by using a conditional branch where we
+\ know the condition is true (i.e. where we'd like to use BRA, but it's not
+\ available as we're targeting the plain 6502). These macros a) document
+\ where this is happening b) make it possible to assert at run time that
+\ the branch always happens.
+macro xbeq_always target
+    beq target
+    cant_happen
+endmacro
+macro xbne_always target
+    bne target
+    cant_happen
+endmacro
+macro xbcc_always target
+    bcc target
+    cant_happen
+endmacro
+macro xbcs_always target
+    bcs target
+    cant_happen
+endmacro
+macro xbpl_always target
+    bpl target
+    cant_happen
+endmacro
+macro xbmi_always target
+    bmi target
+    cant_happen
+endmacro
+macro xbvc_always target
+    bvc target
+    cant_happen
+endmacro
+macro xbvs_always target
+    bvs target
+    cant_happen
+endmacro
+
+\ Set the V flag, clear the N flag and corrupt Z; only setting V is likely
+\ to be desirable, but we document the full behaviour in the macro name to
+\ make it obvious what's happening.
+macro set_v_clear_n_corrupt_z
+    assert rts_for_set_v_clear_n_corrupt_z > andy_end
+                                            \                    NV
+    bit rts_for_set_v_clear_n_corrupt_z     \ RTS opcode is &60=%01100000
+endmacro
+
+\ Assert that a particular label immediately follows; this documents where code
+\ falls through into following code and helps to detect problems if other code
+\ is accidentally interposed.
+macro fall_through_to target
+    assert P% == target
+endmacro
+
+\ Assert that the given 'start' label is on the same page as P%-1; this allows
+\ us to verify that tables for use with abs,X addressing won't incur an
+\ extra cycle penalty. (Note that it *isn't* correct to use this for checking that
+\ a branch won't incur a penalty, as it doesn't include P%; use
+\ xassert_branch_on_same_page_target instead.)
+macro xassert_table_on_one_page start
+    if alignment_assertions_enabled
+        assert hi(start) == hi(P% - 1)
+    endif
+endmacro
+
+\ Assert that the given 'target' label is on the same page as P%; used
+\ immediately after a branch instruction with the same target, this will assert
+\ that no page-crossing penalty is incurred on the branch. Of course, this also
+\ means that any branches within the range target-P% don't suffer a
+\ page-crossing penalty either.
+macro xassert_branch_on_same_page target
+    if alignment_assertions_enabled
+        assert hi(target) == hi(P%)
+    endif
+endmacro
+
+\ This macro is similar to equw but it emits the 16-bit word in big-endian
+\ format. This is useful for the "handler" arguments in parser tables; equh
+\ is more appropriate if the "RTS trick" will be used with the handler argument.
+macro xequw_be target
+    equb hi(target)
+    equb lo(target)
+endmacro
+
+\ This macro is similar to equw but it subtracts one and emits the argument
+\ in big-endian format. This is used to generate jump tables which support
+\ transfer of control by pushing the address bytes and then executing
+\ RTS. Mnemonic: equ*h* for *handler*.
+macro equh target
+    xequw_be target-1
+endmacro
+
+\ Macro used to reliably corrupt oswrch_zp/oswrsc_ptr in debug builds,
+\ to make accidental dependencies on this not being corrupted more obvious.
+macro debug_corrupt_oswrch_zp
+    if debug
+        assert debug_corrupt_oswrch_zp_subroutine > andy_end
+        jsr debug_corrupt_oswrch_zp_subroutine
+    endif
+endmacro
+
+\ Macro used to confirm workspace is available.
+macro xassert_have_workspace
+    if debug
+        assert xassert_have_workspace_subroutine > andy_end
+        jsr xassert_have_workspace_subroutine
+    endif
+endmacro
+
+\ Macro used to confirm oswrch_ww hasn't been corrupted, i.e. it points to the
+\ private workspace.
+macro xassert_oswrch_ww_valid
+    if debug
+        assert xassert_oswrch_ww_valid_subroutine > andy_end
+        jsr xassert_oswrch_ww_valid_subroutine
+    endif
+endmacro
+
+\ Macro used to confirm the stored screen is enabled.
+macro xassert_stored_screen_enabled
+    if debug
+	assert xassert_stored_screen_enabled_subroutine > andy_end
+	jsr xassert_stored_screen_enabled_subroutine
+    endif
+endmacro
+
+\ Macro used to confirm interrupts are disabled.
+macro xassert_interrupts_disabled
+    if debug
+	assert xassert_interrupts_disabled_subroutine > andy_end
+	jsr xassert_interrupts_disabled_subroutine
+    endif
+endmacro
+
+\ Macro used to confirm vectors are claimed.
+macro xassert_vectors_claimed
+    if debug
+        assert xassert_vectors_claimed_subroutine > andy_end
+        jsr xassert_vectors_claimed_subroutine
+    endif
+endmacro
+
+\ Macro used to clear bits in A; mainly used to avoid the awkward 'and &ff'.
+macro xand_not m
+    assert (m and &ff) == m
+    and #(not(m) and &ff)
+endmacro
+
+\ Macro used to assemble ADC #0 or INC A depending on current CPU setting;
+\ there's no performance benefit from this, but it saves a byte when CMOS
+\ instructions can be used.
+macro xadc_0_or_inc_a
+    if CPU == 0
+        xsec
+        adc #0
+    else
+        inc a
+    endif
+endmacro
+
+\ Macro used to page out ANDY; this is only necessary on a Master, but is
+\ harmless on a BBC B/B+. It's nearly as quick to execute these instructions as
+\ to check to see if they're necessary, so the penalty for the BBC B/B+ is
+\ negligible and it saves time on a Master and code in all cases. This isn't a
+\ subroutine because the fast path naturally wants it inlined anyway, and
+\ there are only two other uses so we'd only save one byte by makig it a
+\ subroutine.
+macro page_out_andy
+    xassert_vectors_claimed
+    \ As a micro-optimisation here we save one cycle and one byte by getting
+    \ our ROM bank from the extended vector table; we know we've claimed INSV.
+    lda extended_vector_table + insv_extended_vector_offset + 2
+    sta romsel_copy:sta romsel
+endmacro

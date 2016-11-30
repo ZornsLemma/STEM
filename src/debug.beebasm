@@ -1,0 +1,167 @@
+\ debug.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Code included only in debug builds; this is not generally used directly, but
+\ supports the debug macros in macros.beebasm.
+
+{ \ open file scope
+
+if debug
+
+    \ Subroutine used by the debug_corrupt_oswrch_zp macro
+    .*debug_corrupt_oswrch_zp_subroutine
+    {
+        php:pha:txa:pha
+        ldx #5:lda #&dd
+    .loop
+        sta oswrch_zp,x
+        dex
+        bpl loop
+        sta oswrsc_ptr:sta oswrsc_ptr+1
+        pla:tax:pla:plp
+        rts
+    }
+
+
+    \ Subroutine used by the xassert_have_workspace macro
+    .*xassert_have_workspace_subroutine
+    {
+        php:pha:txa:pha
+        \ ne_iff_workspace happens to live before andy_end; rather than
+        \ reshuffle the ROM, we just work around this as this is debug-only
+        \ code.
+        lda romsel_copy:pha:xand_not romsel_andy:sta romsel_copy:sta romsel
+        jsr ne_iff_workspace:bne ok
+        \ We don't have workspace, so we definitely can't use
+        \ parent_oswrch.
+        lda #'*':xbne_always output_and_hang_nvwrch
+    .ok
+        pla:sta romsel_copy:sta romsel
+        pla:tax:pla:plp
+        rts
+    }
+
+
+    \ Subroutine used by the xassert_oswrch_ww_valid macro
+    .*xassert_oswrch_ww_valid_subroutine
+    {
+        php:pha:txa:pha:tya:pha
+        lda oswrch_ww:pha
+        lda oswrch_ww+1:pha
+        assert init_oswrch_ww_corrupt_axy > andy_end
+        jsr init_oswrch_ww_corrupt_axy
+        pla:cmp oswrch_ww+1:beq ok1
+        \ We could just do a cant_happen but we're not constrained for space
+        \ here so let's be more obvious.
+        lda #'('
+    .^output_and_hang
+        pha:jsr debug_dump_stack:pla
+        jsr parent_oswrch
+        jsr parent_oswrch
+        jsr parent_oswrch
+    .infinite jmp infinite
+    .ok1
+        pla:cmp oswrch_ww:beq ok2
+        lda #')':xbne_always output_and_hang
+    .ok2
+    .^restore_all_and_rts
+        pla:tay:pla:tax
+    .^pla_plp_and_rts
+        pla
+        plp
+        rts
+    }
+
+
+    \ Subroutine used by the xassert_stored_screen_enabled macro
+    .*xassert_stored_screen_enabled_subroutine
+    {
+	xassert_oswrch_ww_valid
+	php:pha:txa:pha:tya:pha
+	ldy #user_options_offset:lda (oswrch_ww),y
+        assert user_option_stored_screen == 1<<7
+	bmi restore_all_and_rts
+        lda #'!':xbne_always output_and_hang
+    }
+
+
+    \ Subroutine used by the xassert_interrupts_disabled macro
+    .*xassert_interrupts_disabled_subroutine
+    {
+        php \ preserve caller's flags
+        pha \ preserve caller's A
+        php:pla \ get caller's flags in A
+        and #flag_i_bit:bne pla_plp_and_rts
+    .^not_ok
+        lda #'$':xbne_always output_and_hang
+    }
+
+
+    \ Subroutine used by the xassert_vectors_claimed macro
+    .*xassert_vectors_claimed_subroutine
+    {
+        php:pha
+        jsr eq_iff_vectors_claimed:beq ok
+        \ We don't use output_and_hang here as it will call
+        \ parent_oswrch, which will call back into here. Instead we just
+        \ write via NVWRCH (which might be invisible, if we're on a BBC B with
+        \ third party shadow RAM) and sit in a loop beeping via NVWRCH.
+        lda #'%'
+    .^output_and_hang_nvwrch
+        jsr nvwrch:jsr nvwrch:jsr nvwrch
+        jsr debug_dump_stack
+    .infinite
+        lda #bel:jsr nvwrch:jmp infinite
+    .ok
+        pla:plp
+        rts
+    }
+        
+
+    \ Copy the CPU stack to &900 so it can be examined after a crash. The top of
+    \ stack is written at &900, so this is a "rotated" copy of the actual stack
+    \ page.
+    .*debug_dump_stack
+    {
+        ldx #0
+    .loop
+        pla:sta &900,x
+        inx:bne loop
+        \ Because we've pulled exactly 256 bytes, the stack pointer is
+        \ back where it started and this RTS will therefore work as
+        \ expected.
+        rts
+    }
+
+
+    \ Code uses "JSR parent_oswrch" to make a call to the parent
+    \ OSWRCH handler; in debug builds that calls this subroutine, which calls
+    \ debug_corrupt_oswrch_zp afterwards so that code doesn't accidentally rely
+    \ on the parent happening to preserve our zp workspace in some cases.
+    .*parent_oswrch
+    {
+	jsr real_parent_oswrch
+	debug_corrupt_oswrch_zp
+	rts
+    }
+
+
+    \ Debug-only workspace; this will only be useful if we are running from
+    \ sideways RAM. TODO: Get rid of this? I don't think I've ever used it yet,
+    \ but it may come in handy so I've left it for now
+    .*debug_oswrch_a equb 0
+
+endif \ if debug
+
+} \ close file scope
+
+if not(debug)
+    \ In non-debug builds, "JSR parent_oswrch" is just "JSR
+    \ real_parent_oswrch", rather than going via the debug subroutine above.
+    parent_oswrch = real_parent_oswrch
+endif

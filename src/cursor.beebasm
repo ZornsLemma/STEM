@@ -1,0 +1,925 @@
+\ cursor.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Implementations of escape sequences which move the cursor around and
+\ associated utility routines.
+
+\ Some of the subroutines in here were sketched out in C first and an attempt
+\ has been made to keep the two in sync; see pseudo.c.
+
+\ There are three different cursors of relevance to us:
+\
+\ 1) The Acorn (OS) cursor position. This is only relevant when using the OS VDU
+\ driver, which most of the time we aren't. However, when we take over from it,
+\ we try to pick up its cursor position, and when we disable ourselves
+\ (temporarily or permanently) we try to update its cursor position to match
+\ ours.
+\
+\ 2) The logical VT102 cursor position of the emulated terminal. This is only
+\ relevant when we're enabled, of course. This determines where characters
+\ written via our OSWRCH handler end up, as well as influencing the behaviour of
+\ many escape sequences. This is "logical" because double-width characters still
+\ count as only one character; where appropriate we double the X co-ordinate to
+\ give a "physical" cursor position (which can only be done based on checking
+\ the line attributes for the line the cursor is on).
+\
+\ 3) The hardware (6845 CRTC) cursor position. This reflects the position
+\ of either the Acorn cursor or the logical VT102 cursor, depending on
+\ whether the OS VDU driver is in charge or we are. (There's a small
+\ wrinkle in the correspondence between cursors 2 and 3 in one case; see
+\ at_end_of_line_auto_wrap.)
+
+{ \ open file scope
+
+\ Common temporary location used by various subroutines
+stop_at_line = oswrch_vl
+count = oswrch_vh
+
+
+\ Given a Y co-ordinate (S0B) in Y, adjust Y if necessary to clamp it within the
+\ margins (if in origin mode) or the screen area (if not in origin mode).
+\
+\ Preserves: X
+.*clamp_y_according_to_origin_mode
+{
+    xassert_oswrch_ww_valid
+    tya:pha
+    ldy #vt102_flags_offset:lda (oswrch_ww),y
+    assert vt102_flag_origin_mode == 1<<7
+    bpl not_origin_mode
+    pla
+    ldy #top_margin_offset:cmp (oswrch_ww),y
+    bcs not_above_top_margin
+    lda (oswrch_ww),y
+.not_above_top_margin
+    assert top_margin_offset + 1 == bottom_margin_offset
+    iny:cmp (oswrch_ww),y
+    bcc not_below_bottom_margin
+    lda (oswrch_ww),y
+.not_below_bottom_margin
+    tay
+    rts
+
+.not_origin_mode
+    pla:tay
+    fall_through_to clamp_y_to_screen
+}
+
+\ Given a Y co-ordinate (S0B) in Y, adjust Y if necessary to clamp it within the
+\ the screen area.
+\
+\ Preserves: X
+.*clamp_y_to_screen
+{
+    tya
+    ldy #emulated_screen_lines_offset:cmp (oswrch_ww),y
+    bcc not_outside_emulated_screen
+    lda (oswrch_ww),y
+    sec:sbc #1
+.not_outside_emulated_screen
+    tay
+    rts
+}
+
+
+\ Handle VT102 horizontal tab (9 &09 011 HT)
+.*vt102_horizontal_tab
+{
+    tab_column = oswrch_ul
+    tab_mask = oswrch_tl
+
+    xassert_oswrch_ww_valid
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y
+    \ There might be a tab at the current X position, but that one should be
+    \ ignored, so we need to advance X by 1, taking care not to set X>79.
+    \ (We don't need to worry about X>39 on a double-width line, as we'll
+    \ clamp the final result to <=39 anyway, but X>79 would index off the
+    \ end of tab_mask_table/tab_stops.)
+    clc:adc #1
+    cmp #80:bcc start_x_lt_80
+    lda #79
+.start_x_lt_80
+    sta tab_column
+    jsr get_tab_stop_mask_and_offset_cursor_x_in_a
+    sta tab_mask
+.loop
+    lda (oswrch_ww),y
+    and tab_mask
+    bne tab_found
+    inc tab_column
+    asl tab_mask
+    bcc loop
+    \ The bit in the mask has now shifted off the end, so move to the next byte.
+    rol tab_mask
+    iny
+    \ Because we always have a tab stop set at position 79, we should never
+    \ actually fall off the end of tab_stops without finding a tab.
+    xbpl_always loop
+.tab_found
+    lda tab_column
+    jmp set_both_cursors_to_logical_x_in_a_current_y
+}
+
+
+{
+\ We've seen <ESC>C (VT52 cursor right)
+.*vt52_cursor_right
+    lda #1:xbne_always cursor_forward_move_a
+
+\ We've seen <ESC>[...C (CUF)
+.*cursor_forward
+    jsr get_constrained_first_parameter_in_a \ A=distance to move (>=1)
+.cursor_forward_move_a
+    \ Move cursor right A logical characters, stopping at the right margin
+    sta count
+    xassert_oswrch_ww_valid
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y
+    clc:adc count
+    \ set_both_cursors_to_logical_x_in_a_current_y will take care of
+    \ double-width lines.
+    cmp #80:bcc not_hit_right_margin
+    lda #79
+.not_hit_right_margin
+    jmp set_both_cursors_to_logical_x_in_a_current_y
+}
+
+
+\ Take the current cursor X position and determine the corresponding bit within
+\ tab_stops. This is returned in the form of a mask (in A, which has exactly one
+\ bit set) and a byte offset *from the start of workspace* within tab_stops in Y.
+\ (So to indicate the relevant byte is tab_stops+1, the return value of Y will
+\ be tab_stops_offset+1.)
+.get_tab_stop_mask_and_offset_current_cursor_x
+{
+    xassert_oswrch_ww_valid
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y
+\ Alternate entry point where the caller provides the X position in A; the
+\ caller guarantees it is in the range [0, 79].
+.^get_tab_stop_mask_and_offset_cursor_x_in_a
+    ldx #0:stx oswrch_tl
+    lsr a:rol oswrch_tl
+    lsr a:rol oswrch_tl
+    lsr a:rol oswrch_tl
+    \ We now have A=(S0B X) / 8, oswrch_tl=bit-reversed((S0B X) % 8).
+    xclc \ 3xROL on an initially-0 byte will leave C clear
+    adc #tab_stops_offset:tay
+    ldx oswrch_tl:lda tab_mask_table,x \ A=(1<<((S0B X) % 8))
+    rts
+}
+
+
+\ We've seen <ESC>H (HTS)
+.*horizontal_tabulation_set
+{
+    xassert_oswrch_ww_valid
+    jsr get_tab_stop_mask_and_offset_current_cursor_x
+    ora (oswrch_ww),y
+    sta (oswrch_ww),y
+    rts
+}
+
+
+\ We've seen <ESC>[...g (TBC)
+.*tabulation_clear
+{
+    xassert_oswrch_ww_valid
+    jsr get_raw_first_parameter_in_a:beq clear_at_cursor
+    cmp #3:bne rts
+    fall_through_to clear_all_tab_stops
+
+\ Clear all tab stops, except for the one we always have at position 79.
+.*clear_all_tab_stops
+    xassert_oswrch_ww_valid
+    ldy #tab_stops_offset+9
+    lda #0
+.loop
+    sta (oswrch_ww),y
+    dey
+    cpy #tab_stops_offset
+    bcs loop
+    xbcc_always common
+
+.clear_at_cursor
+    jsr get_tab_stop_mask_and_offset_current_cursor_x
+    xassert_oswrch_ww_valid
+    eor #255
+    and (oswrch_ww),y
+    sta (oswrch_ww),y
+.common
+    \ We always have a tab stop set at position 79 which cannot be cleared.
+    lda #1<<7:ldy #tab_stops_offset+9:ora (oswrch_ww),y:sta (oswrch_ww),y
+.rts
+    rts
+}
+
+
+\ Replace the current tab stops with the defaults, i.e. one tab every 8 columns
+\ and the one we always have at position 79.
+\ TODO: This has only one caller so it's tempting to inline it via a macro, but
+\ that would introduce an annoying dependency on the ordering of inclusion of
+\ this file and the file which would invoke the macro.
+.*set_default_tab_stops
+{
+    xassert_oswrch_ww_valid
+    jsr clear_all_tab_stops
+    lda #0
+.loop
+    pha
+    jsr get_tab_stop_mask_and_offset_cursor_x_in_a
+    ora (oswrch_ww),y:sta (oswrch_ww),y
+    pla
+    clc:adc #8:cmp #79:bcc loop
+.^set_default_tab_stops_rts
+    rts
+}
+
+
+\ We've seen <ESC>[...r (DECSTBM)
+\ The behaviour for invalid cases here is based on experimenting with
+\ VT100-Hax and xterm and is tested by the itbm-* test cases.
+.*set_margins
+{
+    xassert_oswrch_ww_valid
+
+    \ We don't explicitly check the parameter count; here we rely on the fact
+    \ that the first two parameters will be initialised to 0 by vt102_escape
+    \ and we don't distinguish these implicit 0s from explicit 0s provided
+    \ in the escape sequence. We turn 0 into a suitable default value, 1 for the
+    \ top margin and emulated_screen_lines for the bottom margin.
+    ldy #emulated_screen_lines_offset:lda (oswrch_ww),y:pha
+    ldy #pending_escape_offset+first_parameter_offset:lda (oswrch_ww),y:bne top_not_0
+    lda #1
+.top_not_0
+    tax
+    iny:lda (oswrch_ww),y:bne bottom_not_0
+    pla:pha \ peek emulated_screen_lines into A
+.bottom_not_0
+    tay
+    pla \ A=emulated_screen_lines
+    jsr clamp_x_and_y_to_a
+    \ We now have X=top margin, Y=bottom margin
+    sty oswrch_tl:cpx oswrch_tl:bcs set_default_tab_stops_rts \ we require X<Y
+    tya:jsr one_to_zero:ldy #bottom_margin_offset:sta (oswrch_ww),y
+    txa:jsr one_to_zero:ldy #top_margin_offset:sta (oswrch_ww),y
+    jmp cursor_home_upper_left
+}
+
+
+\ Read the OS cursor position and move both our logical cursor and the hardware
+\ cursor to the closest possible equivalent position allowed by the emulated
+\ terminal.
+.*acorn_to_vt102_cursor
+{
+    lda #osbyte_get_text_cursor_position:jsr osbyte
+
+    jsr clamp_y_according_to_origin_mode
+
+    \ We need the logical cursor X, so if this is a double-width line we
+    \ must halve the physical OS cursor X.
+    xassert_oswrch_ww_valid
+    lda (oswrch_ww),y:beq not_double_width
+    txa:lsr a:tax
+.not_double_width
+
+    \ set_both_cursor_positions_logical_x_y_no_bounds_checking will update the
+    \ fast path flags.
+    jmp set_both_cursor_positions_logical_x_y_no_bounds_checking
+}
+
+
+\ Move the hardware cursor to (X, Y) (logical co-ordinates), adjusting the
+\ cursor size to reflect whether the line is a double-width one or not. The
+\ caller guarantees that Y lies within the emulated screen and that X is in
+\ [0, 39] or [0, 79] depending on whether Y is a double or single-width line
+\ respectively; we do *not* clamp to [0, 39] on double-width lines. (We could,
+\ but there's simply no need for it.)
+.*set_hardware_cursor_position_logical_x_y_no_bounds_checking
+{
+    xassert_oswrch_ww_valid
+
+    \ Set the cursor width appropriately and set oswrch_tl to be the physical X
+    \ co-ordinate.
+    stx oswrch_tl
+    ldx #vucr_mode_0_3_normal_cursor
+    lda (oswrch_ww),y:beq not_double_width
+    ldx #vucr_mode_0_3_double_width_cursor
+    asl oswrch_tl
+.not_double_width
+    \ We access the video ULA directly, updating the OS copy as well; this is
+    \ called as part of handling vt102_line_feed and going via OSBYTE slows us
+    \ down. We don't disable interrupts here; we update the RAM copy first and
+    \ we don't care about the flash bit's state.
+    stx video_ula_control_ram_copy
+    stx video_ula_control_register
+
+    \ Move the hardware cursor to physical co-ordinates (oswrch_tl, Y).
+    ldx oswrch_tl
+    lda mult_640_table_low,y:clc:adc screen_top_line_address:sta oswrch_tl
+    lda mult_640_table_high,y:adc screen_top_line_address+1
+    lsr a:ror oswrch_tl
+    lsr a:ror oswrch_tl
+    lsr a:ror oswrch_tl
+    tay \ Y is high byte of cursor address for CRTC
+    txa:clc:adc oswrch_tl \ A is low byte of cursor address for CRTC
+    bcc no_carry:iny:.no_carry
+    assert crtc_register_cursor_position_high == crtc_register_cursor_position_low - 1
+    ldx #crtc_register_cursor_position_low:stx crtc_register:sta crtc_data
+    dex:stx crtc_register:sty crtc_data
+    rts
+}
+
+
+\ Handle VT102 backspace (8 &08 010 BS) and <ESC>D (VT52 cursor left)
+.*vt102_backspace
+.*vt52_cursor_left
+    lda #1:xbne_always cursor_backward_subroutine_move_a_chars
+
+\ We've seen <ESC>[...D (CUB)
+.*cursor_backward
+    jsr get_constrained_first_parameter_in_a \ A=distance to move (>=1)
+    fall_through_to cursor_backward_subroutine_move_a_chars
+
+\ Move cursor backwards A logical characters, stopping at the left margin
+.cursor_backward_subroutine_move_a_chars
+{
+    sta count
+    xassert_oswrch_ww_valid
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y
+    sec:sbc count:bpl set_both_cursors_to_logical_x_in_a_current_y
+    lda #0:xbpl_always set_both_cursors_to_logical_x_in_a_current_y
+}
+
+
+\ Handle VT102 carriage return (13 &0D 015 CR)
+.*vt102_carriage_return
+    lda #0:xbeq_always set_both_cursors_to_logical_x_in_a_current_y
+
+
+\ set/reset origin mode (DECOM)
+.*set_reset_origin_mode
+    lda #vt102_flag_origin_mode:jsr update_vt102_flags_using_a_x
+.*cursor_home_upper_left
+    ldx #1:ldy #1:xbne_always cursor_home_xy_subroutine
+
+\ We've seen <ESC>[...H (CUP) or <ESC>[...f (HVP)
+.*cursor_home
+.*vt52_cursor_home \ alternate entry used for <ESC>H (VT52 cursor home)
+{
+    xassert_oswrch_ww_valid
+    \ Because vt102_escape always intialises the first two parameter values to 0
+    \ (including in VT52 mode) and cursor_home_xy_subroutine will treat a value
+    \ of 0 as 1, we don't need to do anything clever depending on the number of
+    \ parameters.
+    ldy #pending_escape_offset+first_parameter_offset+1:lda (oswrch_ww),y:tax
+    dey:lda (oswrch_ww),y:tay
+    fall_through_to cursor_home_xy_subroutine
+}
+
+\ Move cursor to logical position (X, Y); the co-ordinates are 1-based relative
+\ to the origin. They will be clamped as required to give a valid position.
+.*cursor_home_xy_subroutine
+{
+    xassert_oswrch_ww_valid
+
+    tmp_x = oswrch_tl
+    tmp_y = oswrch_th
+
+    txa:jsr one_to_zero:sta tmp_x
+    tya:jsr one_to_zero:sta tmp_y
+
+    ldy #vt102_flags_offset:lda (oswrch_ww),y
+    and #vt102_flag_origin_mode:beq no_adjust
+    ldy #top_margin_offset:lda (oswrch_ww),y
+.no_adjust
+    clc:adc tmp_y
+
+    tay:jsr clamp_y_according_to_origin_mode
+
+    \ Clamp X to [0, 79]; set_both_cursors... will handle double-width lines.
+    lda tmp_x:cmp #80:bcc x_ok:lda #79:.x_ok 
+
+    tax:xbpl_always set_both_cursors_to_logical_x_in_x_and_y_in_y
+}
+
+
+\ Take the current logical cursor position (vt102_logical_cursor_x,
+\ vt102_cursor_y), clamp it to 39 if this is a double-width line and then
+\ update both the logical cursor position and the hardware cursor position
+\ to match. 
+\
+\ This isn't quite as futile as it might superficially seem; it's useful when
+\ the current line attributes may have changed without altering the logical
+\ cursor position, or simply if the logical cursor position has been updated
+\ and the change needs to be propagated into the various other bits of state
+\ related to the logical cursor position.
+.*set_both_cursors_to_current_logical_x_y
+    xassert_oswrch_ww_valid
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y
+    fall_through_to set_both_cursors_to_logical_x_in_a_current_y
+
+\ Move the logical cursor and hardware cursor to logical co-ordinates (A,
+\ vt102_cursor_y). If vt102_cursor_y is a double-width line, A will be clamped
+\ to 39. The caller guarantees that A<=79.
+.set_both_cursors_to_logical_x_in_a_current_y
+    tax
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:tay
+    fall_through_to set_both_cursors_to_logical_x_in_x_and_y_in_y \ 0<=Y<32
+
+\ Move the logical cursor and hardware cursor to logical co-ordinates (X, Y). If
+\ Y is a double-width line, X will be clamped to 39. The caller guarantees that
+\ X<=79 and Y lies within the emulated screen.
+.*set_both_cursors_to_logical_x_in_x_and_y_in_y
+    xassert_oswrch_ww_valid
+    lda (oswrch_ww),y
+    beq set_both_cursor_positions_logical_x_y_no_bounds_checking
+    cpx #40:bcc set_both_cursor_positions_logical_x_y_no_bounds_checking
+    ldx #39
+    fall_through_to set_both_cursor_positions_logical_x_y_no_bounds_checking
+
+\ Move the logical cursor and hardware cursor to logical co-ordinates (X, Y);
+\ the caller guarantees that X is in bounds (<=39 for a double-width line,
+\ <=79 for a single-width line) and Y is within the emulated screen.
+.*set_both_cursor_positions_logical_x_y_no_bounds_checking
+{
+    xassert_oswrch_ww_valid
+
+    \ Stash the current line attributes (just the zero/non-zero state)
+    \ for use in updating fast_path_flags below.
+    lda (oswrch_ww),y:php
+
+    \ Update vt102_logical_cursor_x and vt102_cursor_y
+    assert vt102_cursor_y_offset - 1 == vt102_logical_cursor_x_offset
+    tya:pha:ldy #vt102_cursor_y_offset:sta (oswrch_ww),y
+    dey:txa:sta (oswrch_ww),y
+
+    \ Move the hardware cursor
+    pla:tay
+    jsr set_hardware_cursor_position_logical_x_y_no_bounds_checking
+    xassert_oswrch_ww_valid
+
+    \ Clear auto-wrap pending flag and update fast_path_some_line_attributes.
+    ldy #fast_path_flags_offset:lda (oswrch_ww),y
+    xand_not fast_path_auto_wrap_pending or fast_path_some_line_attributes
+    plp:beq no_line_attributes
+    ora #fast_path_some_line_attributes
+.no_line_attributes
+    sta (oswrch_ww),y
+
+    cursor_x = oswrch_vl
+    cursor_y = oswrch_vh
+
+    \ Pre-calculate the address in video RAM corresponding to this cursor
+    \ position; this avoids having to do it in the fast path.
+    assert vt102_logical_cursor_x_offset + 1 == vt102_cursor_y_offset
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:sta cursor_x
+    iny:lda (oswrch_ww),y:sta cursor_y
+    ldy cursor_x
+    ldx #oswrch_u
+    jsr get_video_ram_character_address_logical_x_wrapped
+    lda oswrch_ul:ldy #video_ram_cursor_address_offset:sta (oswrch_ww),y
+    lda oswrch_uh:iny:sta (oswrch_ww),y
+    \ We do the same calculation for the start of the line; again, this is used
+    \ in the fast path.
+    ldy #0
+    lda cursor_y
+    \ X is preserved from before
+    jsr get_video_ram_character_address_logical_x_wrapped
+    lda oswrch_ul:ldy #video_ram_cursor_line_address_offset:sta (oswrch_ww),y
+    lda oswrch_uh:iny:sta (oswrch_ww),y
+
+    \ Pre-calculate the address of the 3-byte group in the stored screen
+    \ corresponding to this cursor position; this avoids having to do it in the
+    \ fast path. If the stored screen is disabled, we generate a fake address
+    \ with the high byte set to 0, which causes the fast path to realise the
+    \ stored screen is disabled.
+    {
+        ldy #user_options_offset:lda (oswrch_ww),y:bmi stored_screen_enabled
+        lda #0:sta oswrch_th
+        xbeq_always common
+    .stored_screen_enabled
+        ldy cursor_x
+        jsr stored_screen_character_address_to_reg_t_wrapped
+        xassert_oswrch_ww_valid
+        lda oswrch_tl
+    .common
+        ldy #stored_screen_cursor_address_offset:sta (oswrch_ww),y
+        iny:lda oswrch_th:sta (oswrch_ww),y
+    }
+    \ We do the same calculation for the start of the line; again, this is used
+    \ in the fast path. If the stored screen isn't enabled all that matters is
+    \ that the value has the high byte 0, so we just re-use the value currently
+    \ in oswrch_t from the previous calculation.
+    {
+        beq common \ A=oswrch_th=0 means no stored screen
+        ldy #0:jsr stored_screen_character_address_to_reg_t_wrapped
+        xassert_oswrch_ww_valid
+        lda oswrch_tl
+    .common
+        ldy #stored_screen_cursor_line_address_offset:sta (oswrch_ww),y
+        iny:lda oswrch_th:sta (oswrch_ww),y
+    }
+
+    rts
+}
+
+
+\ Set the text cursor to be the normal width.
+\ TODO: This has only one caller, it's tempting to inline it via a macro but it
+\ would introduce an awkward cross-file dependency.
+.*set_normal_cursor_width
+    lda #osbyte_write_video_ula_control_register
+    ldx #vucr_mode_0_3_normal_cursor
+    jmp osbyte
+
+
+\ Convert A from 1-based co-ordinates to 0-based co-ordinates by doing
+\ A=min(A-1,0); this means that if A is originally 0 we preserve it.
+\
+\ Preserves: X, Y
+.one_to_zero
+{
+    cmp #0:beq rts
+    xsec \ A>=0 so cmp will have set C
+    sbc #1
+.rts
+    rts
+}
+
+
+\ Handle VT102 line feed (10 &0A 012 LF)
+.*vt102_line_feed
+    xassert_oswrch_ww_valid
+    ldy #vt102_flags_offset:lda (oswrch_ww),y
+    assert vt102_flag_linefeed_new_line_mode == 1<<6
+    asl a:bpl index
+    fall_through_to next_line
+
+\ We've seen <ESC>E (NEL); this *always* moves the cursor to the first position
+\ on the next line and is not affected by the line feed mode setting.
+.*next_line
+    xassert_oswrch_ww_valid
+    lda #0 \ new vt102_logical_cursor_x
+    xbeq_always index_common
+
+\ We've seen <ESC>D (IND); this *always* moves the cursor down a line without
+\ altering the logical X position and is not affected by the line feed mode
+\ setting.
+.*index
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y
+    fall_through_to index_common
+
+\ Move the cursor down one row, scrolling if we hit the bottom margin (but not
+\ if we're already past it).
+\
+\ On entry:
+\   A contains new vt102_logical_cursor_x (which is not necessarily the value
+\   currently stored there)
+.index_common
+{
+    xassert_oswrch_ww_valid
+    tax
+    lda #1:sta count
+    ldy #bottom_margin_offset:lda (oswrch_ww),y
+    ldy #vt102_cursor_y_offset:cmp (oswrch_ww),y
+    beq index_scroll
+    bcc cursor_down_already_below_bottom_margin
+    sta stop_at_line
+    xbcs_always cursor_down_stopping_at_stop_at_line
+}
+
+{
+\ We've seen <ESC>B (VT52 cursor down)
+.*vt52_cursor_down
+    lda #1:xbne_always cursor_down_subroutine_move_a_rows
+
+\ We've seen <ESC>[...B (CUD)
+.*cursor_down
+    jsr get_constrained_first_parameter_in_a \ A=distance to move (>=1)
+    fall_through_to cursor_down_subroutine_move_a_rows
+}
+
+\ Move cursor down A rows, stopping at the bottom margin if we hit it, but
+\ allowing further movement down if we're already past it. We always stop at the
+\ bottom of the screen, though. This never causes scrolling to occur.
+.cursor_down_subroutine_move_a_rows
+{
+    xassert_oswrch_ww_valid
+    sta count
+    ldy #bottom_margin_offset:lda (oswrch_ww),y:sta stop_at_line
+    assert vt102_logical_cursor_x_offset + 1 == vt102_cursor_y_offset
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:tax
+    iny:lda (oswrch_ww),y
+    cmp stop_at_line \ i.e. cmp bottom_margin
+    bcc cursor_down_stopping_at_stop_at_line:beq cursor_down_stopping_at_stop_at_line
+    fall_through_to cursor_down_already_below_bottom_margin
+}
+
+\ Move cursor down count rows; the caller has determined that the cursor is
+\ currently below the bottom margin, so we allow movement down past the
+\ bottom margin but not past the bottom of the screen.
+\
+\ On entry:
+\   X contains new vt102_logical_cursor_x (not necessarily what's stored there)
+\   count contains lines to move down by
+.cursor_down_already_below_bottom_margin
+{
+    \ We're below the bottom margin, so we're allowed to go all the way to
+    \ the last screen line.
+    ldy #emulated_screen_lines_offset:lda (oswrch_ww),y
+    tay:dey:sty stop_at_line
+    fall_through_to cursor_down_stopping_at_stop_at_line
+}
+
+\ Move cursor down count rows, but without allowing it to go past stop_at_line.
+\
+\ On entry:
+\   X contains new vt102_logical_cursor_x (not necessarily what's stored there)
+\   count contains lines to move down by
+\   stop_at_line contains maximum permitted line number
+.cursor_down_stopping_at_stop_at_line
+{
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y
+    clc:adc count
+    cmp stop_at_line:bcc cursor_up_down_not_gone_past
+.^cursor_up_down_gone_past
+    lda stop_at_line
+.^cursor_up_down_not_gone_past
+    tay
+    \ set_both_cursors_to_logical_x_in_x_and_y_in_y will update fast_path_flags.
+    jmp set_both_cursors_to_logical_x_in_x_and_y_in_y
+}
+
+
+{
+\ We've seen <ESC>A (VT52 cursor up)
+.*vt52_cursor_up
+    lda #1:xbne_always cursor_up_subroutine_move_a_rows
+
+\ We've seen <ESC>[...A (CUU)
+.*cursor_up
+    jsr get_constrained_first_parameter_in_a \ A=distance to move (>=1)
+    fall_through_to cursor_up_subroutine_move_a_rows
+}
+
+\ Move cursor up A rows, stopping at the top margin if we hit it, but allowing
+\ further movement up if we're already past it. We always stop at the top of the
+\ screen though. This never causes scrolling to occur.
+.cursor_up_subroutine_move_a_rows
+{
+    xassert_oswrch_ww_valid
+    sta count
+    ldy #top_margin_offset:lda (oswrch_ww),y:sta stop_at_line
+    assert vt102_logical_cursor_x_offset + 1 == vt102_cursor_y_offset
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:tax
+    iny:lda (oswrch_ww),y
+    cmp stop_at_line \ i.e. cmp top_margin
+    bcs not_already_above_top_margin
+    \ We're above the top margin, so we're allow to go all the way to line
+    \ 0.
+    ldy #0:sty stop_at_line
+.not_already_above_top_margin
+    \ A contains vt102_cursor_y
+    sec:sbc count:bmi cursor_up_down_gone_past
+    cmp stop_at_line:bcs cursor_up_down_not_gone_past
+    xbcc_always cursor_up_down_gone_past
+}
+
+
+\ TODO: Would it be possible to optimise index_scroll and reverse_index_scroll
+\ if the scroll region is nearly the entire screen, by hardware scrolling the
+\ entire screen then copying the should-have-been-fixed line(s) back into the
+\ correct position? This way if (say) only the bottom line of the screen is
+\ outside the scroll region, we only need to copy 640 bytes and zero 640 bytes
+\ instead of copying 19840 bytes (in mode 0). I suspect it may be disorienting
+\ for the user to have the supposedly fixed line move, however briefly, but it
+\ might be worth testing this out. (We might be able to afford to wait for
+\ VSYNC in this case, which might help.)
+
+\ Move the cursor down one line; the cursor is on the bottom margin and so this
+\ involves scrolling.
+\
+\ On entry:
+\   X contains new vt102_logical_cursor_x (which is not necessarily the value
+\   currently stored there)
+.index_scroll
+{
+    xassert_oswrch_ww_valid
+
+    txa:ldy #vt102_logical_cursor_x_offset:sta (oswrch_ww),y
+
+    jsr wait_on_no_scroll
+
+    jsr page_in_video_ram
+
+    jsr ne_iff_partial_screen_scroll:bne index_scroll_partial
+
+    \ We're scrolling the entire emulated screen; even if this is smaller
+    \ than the actual Acorn screen, the unused portion below the used
+    \ portion is blank so we can still use hardware scrolling.
+
+    \ Erase the top line of the screen. If the emulated screen fills the entire
+    \ Acorn screen, this erases the line which is about to become the new blank
+    \ bottom line. If the emulated screen doesn't fill the entire Acorn screen,
+    \ this erases the line which is about to become the bottom line of the
+    \ must-be-kept-blank area of unused screen.
+    ldx #0:ldy #1:jsr erase_lines_within_margins
+
+    \ "Hardware scroll" the stored screen characters
+    ldy #stored_screen_start_line_offset
+    lda (oswrch_ww),y
+    clc:adc #1
+    assert (max_screen_lines and (max_screen_lines - 1)) == 0
+    and #(max_screen_lines - 1)
+    sta (oswrch_ww),y
+
+    \ Scroll the stored screen line attributes. This is relatively performance
+    \ critical; we do it every time the full screen scrolls up a line.
+    ldy #emulated_screen_lines_offset:lda (oswrch_ww),y:tax:dex
+    lda oswrch_ww:sec:sbc #1:sta oswrch_tl
+    lda oswrch_ww+1:sbc #0:sta oswrch_th
+    ldy #1
+.line_attribute_loop
+    lda (oswrch_ww),y
+    sta (oswrch_t),y
+    iny
+    dex:bne line_attribute_loop
+    txa:sta (oswrch_t),y
+
+    \ Hardware scroll the video RAM; we do this directly but update the OS
+    \ variables so it knows what we've done (and we ourselves use them to know
+    \ what we've done).
+    lda screen_top_line_address:clc:adc #lo(640):sta screen_top_line_address:sta oswrch_tl
+    lda screen_top_line_address+1:adc #hi(640):bpl no_wrap
+    sec:sbc screen_size_high_byte
+.no_wrap
+
+.^hardware_scroll_video_ram_common_and_index_scroll_common
+    sta screen_top_line_address+1
+    lsr a:ror oswrch_tl
+    lsr a:ror oswrch_tl
+    lsr a:ror oswrch_tl
+    assert crtc_register_screen_start_high + 1 == crtc_register_screen_start_low
+    ldy #crtc_register_screen_start_high:sty crtc_register:sta crtc_data
+    iny:sty crtc_register:lda oswrch_tl:sta crtc_data
+    fall_through_to index_scroll_common
+    
+.^index_scroll_common
+    jsr set_both_cursors_to_current_logical_x_y
+    jsr page_in_main_ram
+    jmp update_fast_path_flags
+
+.index_scroll_partial
+    \ We're scrolling just part of the emulated screen, so we have to physically
+    \ move the bytes around.
+
+    ldy #top_margin_offset:lda (oswrch_ww),y
+    tax:inx               \ from = top_margin + 1
+    tay                   \ to = top_margin
+    jsr copy_lines_within_margins
+
+    ldy #bottom_margin_offset:lda (oswrch_ww),y:tax \ from
+    ldy #max_screen_lines                           \ to
+    jsr erase_lines_within_margins
+
+    jmp index_scroll_common
+}
+
+
+{
+.reverse_index_scroll_partial
+    \ We're scrolling just part of the emulated screen, so we have to physically
+    \ move the bytes around.
+
+    ldy #top_margin_offset:lda (oswrch_ww),y:pha
+    tax                   \ from = top_margin
+    tay:iny               \ to = top_margin + 1
+    jsr copy_lines_within_margins
+
+    pla
+    tax     \ from = top_margin
+    tay:iny \ to = top_margin + 1
+    jsr erase_lines_within_margins
+
+    jmp index_scroll_common
+
+
+\ We've seen <ESC>I (VT52 reverse linefeed) or <ESC>M (RI)
+.*vt52_reverse_linefeed
+.*reverse_index
+    fall_through_to reverse_index_subroutine
+
+\ Move the cursor up one line, scrolling if we hit the top margin (but not if we
+\ are already past it).
+.*reverse_index_subroutine
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y
+    ldy #top_margin_offset:cmp (oswrch_ww),y
+    beq reverse_index_scroll
+    lda #1:jmp cursor_up_subroutine_move_a_rows
+
+.reverse_index_scroll
+    xassert_oswrch_ww_valid
+
+    jsr wait_on_no_scroll
+
+    jsr page_in_video_ram
+
+    jsr ne_iff_partial_screen_scroll:bne reverse_index_scroll_partial
+
+    \ We're scrolling the entire emulated screen; even if this is smaller
+    \ than the actual Acorn screen, the unused portion below the used
+    \ portion is blank so we can still use hardware scrolling.
+
+    \ Before doing anything else, we blank the bottom line which is about to
+    \ scroll off the screen. If the emulated screen fills the hardware screen,
+    \ this line is about to become the new blank top line. If the emulated
+    \ screen is smaller than the hardware screen, this line is about to move
+    \ into the must-be-kept-blank area at the bottom of the screen.
+    ldy #bottom_margin_offset:lda (oswrch_ww),y
+    tax     \ from = bottom_margin
+    tay:iny \ to = bottom_margin + 1
+    jsr erase_lines_within_margins
+
+    \ "Hardware scroll" the stored screen characters
+    ldy #stored_screen_start_line_offset
+    lda (oswrch_ww),y
+    sec:sbc #1
+    assert (max_screen_lines and (max_screen_lines - 1)) == 0
+    and #(max_screen_lines - 1)
+    sta (oswrch_ww),y
+
+    \ Scroll the stored screen line attributes. This is relatively performance
+    \ critical; we do it every time the full screen scrolls down a line.
+    lda oswrch_ww:clc:adc #1:sta oswrch_tl
+    lda oswrch_ww+1:adc #0:sta oswrch_th
+    ldy #emulated_screen_lines_offset:lda (oswrch_ww),y
+    tay:dey:dey
+.line_attribute_loop
+    lda (oswrch_ww),y
+    sta (oswrch_t),y
+    dey
+    bpl line_attribute_loop
+    iny:tya:sta (oswrch_ww),y
+
+    \ Hardware scroll the video RAM
+    lda screen_top_line_address:sec:sbc #lo(640):sta screen_top_line_address:sta oswrch_tl
+    lda screen_top_line_address+1:sbc #hi(640)
+    cmp screen_memory_start_high_byte:bcs no_wrap
+    xclc
+    adc screen_size_high_byte
+.no_wrap
+    jmp hardware_scroll_video_ram_common_and_index_scroll_common
+}
+
+
+\ Busy wait while the 'no scroll' flag is set; this is updated by the INSV
+\ handler in response to the emulated 'NO SCROLL' key.
+.wait_on_no_scroll
+{
+    xassert_oswrch_ww_valid
+
+    \ If the 'no scroll' flag isn't set, we can return immediately.
+    ldy #no_scroll_offset:lda (oswrch_ww),y:beq ne_iff_partial_screen_scroll_rts
+
+    \ Wait until 'no scroll' flag is cleared (by our INSV handler)
+.loop
+    \ Turn CAPS LOCK and SHIFT LOCK LEDs on. We have to do this repeatedly as
+    \ the OS interrupt handler will keep setting them back to reflect the actual
+    \ CAPS LOCK/SHIFT LOCK setting.
+    ldx #system_via_addressable_latch_caps_lock_led
+    stx system_via_addressable_latch
+    assert system_via_addressable_latch_shift_lock_led == system_via_addressable_latch_caps_lock_led + 1
+    inx:stx system_via_addressable_latch
+
+    lda (oswrch_ww),y
+    bne loop
+
+    \ Set the LEDs back to the correct state, and we're done.
+    lda #osbyte_reflect_keyboard_status_in_leds:jmp osbyte
+}
+
+
+\ Check to see if the top/bottom margins coincide with the full screen; return
+\ so that BNE will branch iff they don't (i.e. if any scroll has to be a partial
+\ screen scroll rather than a full screen scroll).
+\
+\ Preserves: X
+.ne_iff_partial_screen_scroll
+{
+    xassert_oswrch_ww_valid
+    ldy #top_margin_offset:lda (oswrch_ww),y
+    bne ne_iff_partial_screen_scroll_rts
+    ldy #bottom_margin_offset:lda (oswrch_ww),y
+    clc:adc #1
+    ldy #emulated_screen_lines_offset:cmp (oswrch_ww),y
+.^ne_iff_partial_screen_scroll_rts
+    rts
+}
+
+} \ close file scope

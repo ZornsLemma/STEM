@@ -1,0 +1,799 @@
+\ emulation-control.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Code to turn the emulation on and off and update the user settings while the
+\ emulation is active.
+
+{ \ open file scope
+
+\ Locations used to return values from init_table_offset_workspace_offset
+table_offset = oswrch_vl
+workspace_offset = oswrch_vh
+
+
+\ This is memberwise paired with vector_number_table, although as a special case
+\ we don't have a member here for WRCHV; see turn_emulation_on.
+.our_vector_table
+    equw our_buffer_insert
+    equw our_buffer_remove
+    equw our_buffer_count_purge
+assert P% - our_vector_table == (our_vector_count - 1) * 2
+
+
+\ Update the emulation settings.
+\
+\ On entry:
+\   Vectors are claimed (the emulation may be disabled or enabled)
+\   A contains the new value for user_options
+\   X contains 0 for VT52 mode or non-0 for ANSI mode
+\
+\ The caller is responsible for ensuring we have large workspace before
+\ setting user_option_stored_screen using this subroutine.
+.*update_emulation_settings
+{
+    xassert_oswrch_ww_valid
+    xassert_vectors_claimed
+
+    pha \ stash the user options supplied by the caller for later
+
+    \ Select VT52 or ANSI mode as requested by the caller
+    txa:bne ansi
+    jsr set_vt52_mode_subroutine
+    jmp done_ansi_vt52
+.ansi
+    jsr set_ansi_mode_subroutine
+.done_ansi_vt52
+
+    \ Save the new user options supplied by the caller, checking the stored
+    \ screen option so that if it's just been turned on, we clear the stored
+    \ screen (it will contain arbitrary junk if it's never been turned on before,
+    \ or outdated screen contents if it was on and then off earlier).
+    ldy #user_options_offset:lda (oswrch_ww),y
+    and #user_option_stored_screen:sta transient_zp
+    pla:sta (oswrch_ww),y
+    and #user_option_stored_screen:beq stored_screen_now_off
+    cmp transient_zp:beq stored_screen_was_on_and_stays_on
+    \ The stored screen was off and is now on, so we need to clear all the
+    \ characters and character attributes. The line attributes are maintained
+    \ even without the stored screen on, so we leave those alone.
+    ldx #0
+    ldy #max_screen_lines
+    set_v_clear_n_corrupt_z
+    clc
+    jsr erase_lines_within_screen_accepting_v
+.stored_screen_was_on_and_stays_on
+.stored_screen_now_off
+
+    \ If the emulation is disabled due to being in an unsupported mode,
+    \ there's nothing else to do - we've recorded the relevant options and
+    \ they will kick in when there's a mode change which enables the emulation.
+    ldy #emulation_disabled_offset:lda (oswrch_ww),y
+    assert emulation_disabled_unsupported_mode == 1<<0
+    lsr a:bcs apply_user_options_rts
+
+    \ Record the number of lines on the emulated screen before our change;
+    \ apply_user_options_common will recalculate emulated_screen_lines taking
+    \ the new user options into account.
+    ldy #emulated_screen_lines_offset:lda (oswrch_ww),y:pha
+
+    jsr apply_user_options_common
+
+    \ If the number of lines on the emulated screen has changed, we need to make
+    \ some adjustments.
+    pla
+    ldy #emulated_screen_lines_offset:cmp (oswrch_ww),y
+    beq emulated_screen_size_not_changed
+
+    \ The number of lines on the emulated screen has changed. First we need to
+    \ reset the top and bottom margins, so that the full screen (and no more
+    \ than the full screen) is available for use.
+    jsr reset_top_bottom_margins
+
+    \ If we've reduced the number of lines on the emulated screen, we
+    \ need to ensure that the no-longer-used bottom portion of both the
+    \ hardware and stored screens is empty. Note that we rely on the fact
+    \ that erase_lines_within_screen doesn't perform any bounds checking
+    \ against emulated_screen_lines here.
+    jsr page_in_video_ram
+    ldy #emulated_screen_lines_offset:lda (oswrch_ww),y:tax \ from
+    ldy #acorn_screen_lines_offset:lda (oswrch_ww),y:tay    \ to
+    sec \ clear stored screen and video RAM
+    jsr erase_lines_within_screen
+    jsr page_in_main_ram
+
+.emulated_screen_size_not_changed
+
+    \ We constrain the cursor to be within the appropriate part of the
+    \ screen, which is not strictly necessary unless we changed the
+    \ margins via reset_top_bottom_margins above. However, we want to
+    \ update the cursor position in all cases, as this has the side effect
+    \ of updating the addresses held in stored_screen_cursor_address
+    \ and video_ram_cursor_address, and particularly the flag embedded
+    \ in these indicating whether the stored screen is enabled or
+    \ not. update_fast_path_flags doesn't do this; there's generally no need
+    \ to do it outside of a cursor movement actually happening.
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:tay
+    jsr clamp_y_according_to_origin_mode
+    tya:ldy #vt102_cursor_y_offset:sta (oswrch_ww),y
+    jsr set_both_cursors_to_current_logical_x_y
+
+    \ Finally, update fast_path_flags to reflect all the changes we've made, and
+    \ we're done.
+    jmp update_fast_path_flags
+}
+
+
+\ Apply some user options to the emulator state and the hardware. Many just take
+\ effect when some operation checks them, but some require "immediate"
+\ action. This subroutine factors out a couple which are needed in two different
+\ code paths (turning the emulation on for the first time and altering the
+\ emulation options once on):
+\
+\ - If mode 3 is gappy or gapless, we need to make the necessary change when
+\   mode 3 is entered or, if we're already in mode 3, when the user may have
+\   changed this option.
+\
+\ - If the screen mode has changed or the user may have changed the number of
+\   requested lines on the emulated screen, we need to set the actual number of
+\   emulated lines to the smaller of the hardware screen size in lines and the
+\   requested number of lines.
+\
+\ This should only be called in a supported mode and when the vectors are
+\ claimed or the emulation is being turned on.
+\
+\ This is called from the OSWRCH handler (in mode_changed_subroutine)
+\ as well as in response to * commands; it therefore must not use the
+\ transient_zp addresses.
+.apply_user_options_common
+{
+    xassert_oswrch_ww_valid
+
+    \ Make mode 3 gapless or gappy; if we just entered mode 3 then making it
+    \ gappy is redundant, but this way we also handle the case where this
+    \ subroutine is used after the user options are updated.
+    lda acorn_screen_mode:cmp #3:bne not_mode_3
+    ldx #mode_3_gap_control_gapless
+    ldy #user_options_offset:lda (oswrch_ww),y
+    assert user_option_mode_3_gapless == 1<<6
+    asl a:bmi gapless
+    ldx #mode_3_gap_control_gappy
+.gapless
+    jsr mode_3_gap_control
+.not_mode_3
+
+    \ Set emulated_screen_lines=min(acorn_screen_lines, requested_screen_lines)
+    ldy #user_options_offset:lda (oswrch_ww),y:and #user_options_lines_mask
+    tax:lda user_option_lines_table,x \ A=requested screen lines
+    ldy #acorn_screen_lines_offset:cmp (oswrch_ww),y
+    bcc requested_screen_lines_lt_acorn_screen_lines
+    lda (oswrch_ww),y
+.requested_screen_lines_lt_acorn_screen_lines
+    assert acorn_screen_lines_offset + 1 == emulated_screen_lines_offset
+    iny:sta (oswrch_ww),y
+
+.^apply_user_options_rts
+    rts
+}
+
+
+\ Turn the emulation on, i.e. claim the vectors and initialise the emulation
+\ to a fixed initial state (ANSI mode, default options). An OS error will
+\ be generated if no workspace is available. On exit the emulation will be
+\ enabled or disabled as appropriate for the current mode and text window
+\ state. This is a no-op if the vectors are already claimed; it does *not*
+\ re-initialise the emulation in this case.
+\
+\ This doesn't touch transient_zp or transient_zp+1 to avoid clashing with
+\ command_options (in service.beebasm).
+.*turn_emulation_on
+{
+    parent_vector_ptr           = transient_zp+2 \ 2 bytes
+    vector_index                = transient_zp+4 \ 1 byte
+    vector_number_times_2       = transient_zp+5 \ 1 byte
+    vector_number_times_3       = transient_zp+6 \ 1 byte
+
+    jsr ne_iff_workspace:bne have_workspace
+    jsr generate_error
+    equs error_number, "No workspace; do *"
+    name
+    equb 0
+.have_workspace
+
+    jsr eq_iff_vectors_claimed:beq apply_user_options_rts
+    
+.vectors_not_claimed
+    \ Zero the non-stored-screen workspace; this gives us a generally sane
+    \ starting point and will avoid randomness if we forget to explicitly
+    \ initialise anything. This sets user_options to 0, which in particular
+    \ means we have no stored screen; this is the safe option since we
+    \ may not have enough workspace for one. update_emulation_settings
+    \ will do the appropriate setup if this is turned on later.
+    lda #0:tay
+.zero_loop
+    dey
+    sta (oswrch_ww),y
+    bne zero_loop
+
+    \ Set up the debug canaries.
+    if debug
+        lda #canary_value
+        ldy #pending_escape_canary_offset
+        sta (oswrch_ww),y
+        ldy #input_buffer_canary_offset
+        sta (oswrch_ww),y
+    endif
+
+    \ Check the host type and configure ourselves accordingly.
+    jsr call_osbyte_identify_host
+    \ X identifies the host operating system. For our purposes, we are
+    \ interested in two variable aspects: 1) where the OS character bitmaps
+    \ are located 2) whether the shadow RAM is inaccessible to direct memory
+    \ access. We build up the host_flags value in A.
+    lda #0
+    cpx #2:bne not_b_plus
+    \ Shadow RAM on the BBC B+ can only be accessed by code running in the OS
+    \ memory space or part of the 12K private RAM bank. TODO: I think this can be
+    \ supported with a bit of clever copying of code into the 12K private RAM
+    \ bank, but I'm not doing it yet. (Also our primary use case is with a
+    \ second processor, so this isn't a huge limitation, although it's a shame.)
+    ora #host_flag_inaccessible_shadow_ram
+.not_b_plus
+    cpx #3:bcc not_master1
+    \ We're running on a Master.
+    ora #host_flag_master
+.not_master1
+.host_flags_determined
+    ldy #host_flags_offset:sta (oswrch_ww),y
+
+    \ We now call mode_changed_subroutine; this will perform a lot of
+    \ initialisation including enabling/disabling the emulation as appropriate.
+    jsr mode_changed_subroutine
+
+    \ We can now reset the terminal to its initial state; we leave the screen
+    \ alone since the stored screen is disabled (and mode_changed_subroutine
+    \ would have erased it if it wasn't, anyway) and we want to leave
+    \ the hardware screen alone to make the transition as seamless as
+    \ possible. This comes after mode_changed_subroutine since it needs
+    \ to know how many lines are on the emulated screen in order to reset
+    \ the bottom margin appropriately. This also ensures fast_path_flags is
+    \ consistent with the rest of the workspace; our zeroing out earlier on
+    \ almost certainly left it inconsistent.
+    jsr reset_terminal_except_erase_screen
+
+    \ All our state is now initialised appropriately, so we can go ahead and
+    \ actually claim the vectors - as soon as we do this we could get called, so
+    \ it was important to get the state set up first.
+
+    lda oswrch_ww:clc:adc #parent_vector_offset:sta parent_vector_ptr
+    lda oswrch_ww+1:sta parent_vector_ptr+1
+
+    \ We must disable interrupts while we're claiming the vectors.
+    sei
+
+    lda #(our_vector_count-1):sta vector_index
+    \ Loop over each of the vectors we want to claim. Note the distinction
+    \ in this loop between vector *index* (an offset within our own tables
+    \ inside the ROM) and vector *number* (the offset within the OS tables).
+    \ For most vectors we save the old handler and install a handler using
+    \ the extended vector mechanism; WRCHV is an exception and we just save
+    \ the current handler in this loop.
+.vector_loop
+    \ Get the vector number (INSV=21, etc) in A
+    ldx vector_index:lda vector_number_table,x
+
+    \ Multiply the vector number by 2 and 3 for use below
+    sta vector_number_times_3
+    asl a:sta vector_number_times_2 \ leaves carry clear
+    xclc:adc vector_number_times_3:sta vector_number_times_3
+
+    \ Save the low byte of the current handler and, provided this isn't WRCHV,
+    \ install the low byte of the extended vector entry point, which is the
+    \ vector number*3.
+    lda vector_index:asl a:tay \ Y=vector index*2
+    ldx vector_number_times_2
+    lda vector_base,x:sta (parent_vector_ptr),y
+    cpx #wrchv_number*2:beq wrchv_dont_install1
+    lda vector_number_times_3:sta vector_base,x
+.wrchv_dont_install1
+
+    \ Save the high byte of the current handler and, provided this isn't
+    \ WRCHV, install the high byte of the extended vector entry point,
+    \ which is always &ff.
+    inx:iny
+    lda vector_base,x:sta (parent_vector_ptr),y
+    cpx #wrchv_number*2+1:beq wrchv_dont_install2
+    lda #&ff:sta vector_base,x
+
+    \ Set up the extended vector; this isn't WRCHV.
+    \ Y=vector index*2+1 at this point
+    ldx vector_number_times_3
+    lda our_vector_table-1,y:sta extended_vector_table,x
+    lda our_vector_table,y:sta extended_vector_table+1,x
+    lda romsel_copy:sta extended_vector_table+2,x
+.wrchv_dont_install2
+
+    dec vector_index:bpl vector_loop
+
+    \ We now need to copy a short machine code routine - which we refer to
+    \ as the OSWRCH shim - to oswrch_shim_ram and tweak it for the current
+    \ settings. We will then install this as the OSWRCH handler. The
+    \ advantage of this is that we can a) avoid the overhead of going
+    \ through the extended vector mechanism for every OSWRCH call (this
+    \ alone saves about 24% on the time taken on the "FNlong_lines_wrap"
+    \ test in speed.bas) b) we can optimise the entry to our OSWRCH handler
+    \ still further, e.g. by initialising oswrch_ww directly with the correct
+    \ value instead of deriving it from our private workspace byte (this saves
+    \ an additional 4% on the that benchmark, for a total reduction of 28%).
+    ldx #oswrch_shim_size-1
+    assert oswrch_shim_size <= oswrch_shim_ram_size
+    assert oswrch_shim_size <= 128 \ otherwise bpl in shim_copy_loop is wrong
+.shim_copy_loop
+    lda oswrch_shim_rom,x:sta oswrch_shim_ram,x
+    dex:bpl shim_copy_loop
+
+    \ Patch up the RAM copy of the shim with our workspace address.
+    lda oswrch_ww+1:sta oswrch_shim_ram+oswrch_shim_lda_workspace_high_offset+1
+
+    \ Host type-specific shim patching:
+    \ - We need to patch it to page in our ROM. On the Master, we also make it
+    \   page in ANDY at the same time, to save us having to do it on the fast
+    \   path.
+    \ - The ROM copy of the shim has the BBC B/B+ OSWRCH handler address
+    \   embedded in it; on a Master, we need to change this to the Master OSWRCH
+    \   handler.
+    jsr call_osbyte_identify_host
+    ldy romsel_copy
+    cpx #3:bcc not_master2
+    lda #lo(our_oswrch_master):sta oswrch_shim_ram+oswrch_shim_jmp_rom_handler_offset+1
+    lda #hi(our_oswrch_master):sta oswrch_shim_ram+oswrch_shim_jmp_rom_handler_offset+2
+    tya:ora #romsel_andy:tay
+.not_master2
+    sty oswrch_shim_ram+oswrch_shim_lda_our_bank_offset+1
+
+    \ Actualy redirect OSWRCH to oswrch_shim_ram.
+    lda #lo(oswrch_shim_ram):sta wrchv
+    lda #hi(oswrch_shim_ram):sta wrchv+1
+
+    \ Re-enable interrupts and we're done.
+    cli
+.^turn_emulation_on_rts
+    rts
+}
+
+
+\ Turn the emulation off, i.e. release the vectors and restore the OS/hardware
+\ state. This is a no-op if the vectors are not already claimed.
+.*turn_emulation_off
+{
+    parent_vector_ptr = transient_zp   \ 2 bytes
+    vector_index      = transient_zp+2 \ 1 byte
+
+    \ Are the vectors claimed? Unless they are, this is a no-op.
+    jsr eq_iff_vectors_claimed:bne turn_emulation_on_rts
+
+    \ Restore the OS keyboard settings to the values they had before we fiddled
+    \ with them.
+    jsr set_user_keyboard_settings
+
+    \ If we're currently enabled, move the OS cursor to the best possible
+    \ approximation of its current position to make the transition as seamless
+    \ as possible.
+    xassert_oswrch_ww_valid
+    ldy #emulation_disabled_offset:lda (oswrch_ww),y:bne emulation_disabled
+    jsr vt102_to_acorn_cursor
+.emulation_disabled
+
+    \ If we're in mode 3, revert to the standard "gappy" appearance. (Note
+    \ that we do this even if we're disabled, because we don't revert this
+    \ change when we become temporarily disabled, so we need to do it now we're
+    \ being turned off.)
+    lda acorn_screen_mode:cmp #3:bne not_mode_3
+    ldx #mode_3_gap_control_gappy
+    jsr mode_3_gap_control
+.not_mode_3
+
+    lda oswrch_ww:clc:adc #parent_vector_offset:sta parent_vector_ptr
+    lda oswrch_ww+1:sta parent_vector_ptr+1
+
+    \ Disable interrupts while we're uninstalling our handlers
+    sei
+
+    \ Restore the original handlers saved when we claimed the vectors. As in
+    \ turn_emulation_on, note the distinction between vector *index* and vector
+    \ *number*.
+    lda #(our_vector_count-1):sta vector_index
+.vector_loop
+    ldx vector_index:lda vector_number_table,x      \ A=vector number
+    asl a:tax                                       \ X=vector number*2
+    lda vector_index:asl a:tay                      \ Y=vector index*2
+    lda (parent_vector_ptr),y:sta vector_base,x
+    iny
+    lda (parent_vector_ptr),y:sta vector_base+1,x
+    dec vector_index:bpl vector_loop
+
+    \ Re-enable interrupts
+    cli
+
+    \ Because we use os_keyboard_buffer to hold our OSWRCH shim, if there
+    \ are any keys in the OS buffer when the emulation is turned on they
+    \ will be overwritten by our shim. This has no immediate effect as our
+    \ INSV/REMV/CNPV handlers don't examine the OS buffer, but when the
+    \ emulation is later turned off the OS still thinks the keys are in the
+    \ OS buffer and tries to return them; this would be confusing anyway, as
+    \ the keypresses might have been inserted hours ago, but it's even worse
+    \ as we have overwritten them and the OS will read our OSWRCH shim code
+    \ instead. We flush the OS buffer to avoid this problem. TODO: We could
+    \ in principle take the keys out of the OS buffer when the emulation
+    \ is turned on and insert them into our own, and indeed we could do
+    \ the reverse with any keys left in our buffer when the emulation is
+    \ turned off; this seems a lot of effort for little practical benefit
+    \ so I haven't implemented it yet.
+    lda #osbyte_flush_specific_buffer:ldx #keyboard_buffer_number:jmp osbyte
+}
+
+
+\ Update the emulation state to reflect an Acorn mode change; this is also used
+\ when the emulation is first turned on even though there hasn't strictly been a
+\ mode change.
+\
+\ This is called from the OSWRCH handler as well as in response to * commands;
+\ it therefore must not use the transient_zp addresses.
+.*mode_changed_subroutine
+{
+    xassert_oswrch_ww_valid
+
+    \ We record whether or not this is a shadow mode so we can use that
+    \ information to decide whether we need to page in shadow RAM when trying
+    \ to perform direct screen access. If we're in a shadow mode on a machine
+    \ where we can't directly access shadow RAM, we disable ourselves.
+    ldy #host_flags_offset:lda (oswrch_ww),y
+    xand_not host_flag_shadow_mode:sta (oswrch_ww),y
+    lda #osbyte_read_himem:jsr osbyte \ YX=HIMEM; <&8000 means not shadow mode
+    tya:bpl not_shadow_mode
+    ldy #host_flags_offset:lda (oswrch_ww),y
+    and #host_flag_inaccessible_shadow_ram:bne unsupported_mode
+    lda (oswrch_ww),y:ora #host_flag_shadow_mode:sta (oswrch_ww),y
+.not_shadow_mode
+
+    lda #32
+    ldy acorn_screen_mode \ shadow modes *don't* have bit 7 set in here
+    beq mode_0
+    cpy #3:beq mode_3
+.unsupported_mode
+    \ We're in an unsupported mode, so disable ourselves.
+    lda #emulation_disabled_unsupported_mode
+    ldy #emulation_disabled_offset:sta (oswrch_ww),y
+    jsr set_user_keyboard_settings
+    jmp update_fast_path_flags
+
+.mode_3
+    lda #25
+.mode_0
+    ldy #acorn_screen_lines_offset:sta (oswrch_ww),y
+
+    \ If there was actually a mode change, none of the special VDU statuses
+    \ which can cause us to be temporarily disabled can apply as a mode
+    \ change resets them. Since this subroutine is also used when the user
+    \ turns on the emulation, we check for them anyway.
+    assert emulation_disabled_text_window_set == vdu_status_text_window_set
+    assert emulation_disabled_text_at_graphics == vdu_status_text_at_graphics
+    assert emulation_disabled_screen_disabled == vdu_status_screen_disabled
+    xassert_oswrch_ww_valid
+    lda vdu_status:and #(vdu_status_text_window_set or vdu_status_text_at_graphics or vdu_status_screen_disabled)
+    ldy #emulation_disabled_offset:sta (oswrch_ww),y
+
+    jsr apply_user_options_common
+
+    \ A mode change will reset the screen to white-on-black; we update the
+    \ (DEC) screen mode flag accordingly. (If we've just been turned on and
+    \ there hasn't been a mode change, whatever palette colours the user has
+    \ set are implicitly defined by this to be the non-reverse-video colours.)
+    ldy #vt102_flags_offset:lda (oswrch_ww),y
+    xand_not vt102_flag_screen_mode:sta (oswrch_ww),y
+
+    \ The screen size may have changed and even if it hasn't we reset the top
+    \ and bottom margins to the full screen; a mode change acts as a kind of
+    \ "soft reset" in this respect. (We don't reset lots of other things,
+    \ although we could; this is all non-standard functionality so we get to
+    \ define the behaviour.)
+    jsr reset_top_bottom_margins
+
+    \ We reset escape_seq_len since it makes no sense to split an escape
+    \ sequence across a mode change or the like. (If nothing else, we
+    \ might have been part-way through an escape sequence, changed into
+    \ an unsupported mode then much much later we return to a supported mode,
+    \ at which point we would suddenly swallow the first few characters
+    \ to complete the escape sequence.)
+    xassert_oswrch_ww_valid
+    ldy #escape_seq_len_offset:lda #escape_seq_len_none:sta (oswrch_ww),y
+
+    \ Clear the stored screen *only*; we leave the video RAM alone, since
+    \ on a true mode change the OS has done this for us, and if we're using
+    \ this to pick up the current mode after just being turned on, we prefer
+    \ to leave the video RAM alone to pick up control as transparently as
+    \ possible. (It's important to clear all max_screen_lines since the
+    \ "hardware scrolling" of the stored screen relies on any unused portion
+    \ being blank, just as with hardware scrolling of the video RAM.)
+    ldx #0                \ from
+    ldy #max_screen_lines \ to
+    clc                   \ clear the stored screen only
+    jsr erase_lines_within_screen
+
+    \ Update the VT102 cursor location to match the Acorn cursor; if
+    \ the mode just changed it will have gone to the top left, and if
+    \ we've just been enabled we want to pick up the current location as
+    \ part of our "don't clear the screen, take over as transparently as
+    \ possible" policy. If the cursor is outside the area of the screen
+    \ used by the emulation, this will haul it back within bounds. Note that
+    \ we do this *after* erasing the screen, since otherwise we may
+    \ incorrectly size the cursor based on the relevant line having been a
+    \ double-width one before the screen was cleared.
+    jsr acorn_to_vt102_cursor
+
+    \ We're fully or partially enabled, so configure the OS keyboard settings as
+    \ required by our input handlers.
+    jsr set_our_keyboard_settings
+
+    \ Finally, update fast_path_flags to reflect all the changes we've made, and
+    \ we're done.
+    jmp update_fast_path_flags
+}
+
+
+\ Adjust CRTC settings so that mode 3 is either gapless or gappy (normal).
+\
+\ On entry:
+\   current mode is mode 3
+\   X is mode_3_gap_control_gapless or mode_3_gap_control_gappy
+\
+\ On exit:
+\   A, X and Y are corrupted
+\   zero page workspace is untouched
+.mode_3_gap_control
+{
+    ldy #mode_3_gap_control_register_list_last_index
+    sec \ indicate r7 special case; most instructions in the loop don't touch C
+.loop
+    lda mode_3_gap_control_register_list,y:sta crtc_register
+    lda mode_3_gap_control_value_list,x
+    bcc not_r7_special_case
+    \ See http://stardot.org.uk/forums/viewtopic.php?f=3&t=11067; this code
+    \ reproduces the special-case handling in the OS, and ensures that we
+    \ respect the user's *TVn setting to move the screen up/down. (We could use
+    \ VDU 23,0,R,V,0,0,0,0,0,0 to get the OS to set the CRTC registers for us,
+    \ but that would involve calling NVWRCH and we'd have to assume all our zp
+    \ workspace was corrupted.)
+    xsec \ bcc didn't branch
+    adc vdu_vertical_adjust
+    clc \ indicate r7 special case no longer wanted
+.not_r7_special_case
+    sta crtc_data
+    dex
+    dey
+    bpl loop
+    rts
+}
+
+
+\ Return so BNE will branch iff the vectors have been claimed.
+\
+\ Preserves: X, Y
+.*eq_iff_vectors_claimed
+{
+    lda wrchv:cmp #lo(oswrch_shim_ram):bne rts
+    lda wrchv+1:cmp #hi(oswrch_shim_ram)
+.rts
+    rts
+}
+
+
+\ set/reset auto repeat mode (DECARM)
+.*set_reset_auto_repeat_mode
+    lda #vt102_flag_auto_repeat_mode:jsr update_vt102_flags_using_a_x
+    fall_through_to set_our_keyboard_settings
+
+
+\ Set the OS keyboard settings up the way our INSV handler expects. Mostly
+\ it sees internal keycodes which aren't affected by OS settings, but some
+\ OS settings do affect what INSV sees, so we configure the OS as we expect
+\ when we're enabled; we save the previous settings so we can restore them
+\ when we're disabled.
+.*set_our_keyboard_settings
+{
+    xassert_oswrch_ww_valid
+
+    \ We mustn't set our settings multiple times; the actual setting would be
+    \ harmless, but we'd then overwrite the saved values which we use for later
+    \ restoring the user's settings when we're disabled.
+    ldy #host_flags_offset:lda (oswrch_ww),y
+    assert host_flag_our_keyboard_settings == 1<<6
+    asl a:bmi already_our_settings
+    lda (oswrch_ww),y:ora #host_flag_our_keyboard_settings:sta (oswrch_ww),y
+
+    \ Set our settings and save the previous values for restoring later. This
+    \ will very briefly set a keyboard auto-repeat delay of zero, but we'll
+    \ immediately restore the previous value when we fall through to
+    \ already_our_settings.
+    jsr init_table_offset_workspace_offset
+.loop
+    ldy table_offset
+    lda osbyte_a_table,y
+    ldx osbyte_x_table,y
+    ldy #0
+    jsr osbyte \ set value in X, returns with X containing old value
+    ldy workspace_offset:txa:sta (oswrch_ww),y
+    dec workspace_offset
+    dec table_offset
+    bpl loop
+
+.already_our_settings
+    \ Set the keyboard auto-repeat mode. Note that we do this even if our
+    \ settings have already been installed; this is harmless (because we
+    \ aren't storing the user's value here) and necessary (because we rely
+    \ on this behaviour in set_reset_auto_repeat_mode).
+    \
+    \ We use the stored auto-repeat delay value when we enable auto-repeat
+    \ mode; this means a) we respect the user's preference instead of
+    \ slavishly copying the 0.5s delay used by a real VT102 b) if the user
+    \ had turned auto-repeat off before we were enabled, we will cheerfully
+    \ use that setting to "enable" auto-repeat - we could easily turn 0 into
+    \ (say) 32 here, but my reasoning here is that if the user had turned
+    \ off auto-repeat explicitly they must have some good reason for really
+    \ not wanting it.
+    ldx #0 \ auto-repeat disabled
+    ldy #vt102_flags_offset:lda (oswrch_ww),y:and #vt102_flag_auto_repeat_mode
+    beq auto_repeat_disabled
+    ldy #(os_settings_offset + user_keyboard_auto_repeat_delay_index)
+    lda (oswrch_ww),y:tax
+.auto_repeat_disabled
+    lda #osbyte_set_keyboard_auto_repeat_delay:ldy #0:jmp osbyte
+}
+
+
+\ Restore the OS settings to the values they had before
+\ set_our_keyboard_settings was called.
+.set_user_keyboard_settings
+{
+    xassert_oswrch_ww_valid
+
+    \ If we haven't actually installed our own settings, there's nothing to do.
+    ldy #host_flags_offset:lda (oswrch_ww),y
+    assert host_flag_our_keyboard_settings == 1<<6
+    asl a:bpl already_user_settings
+    lda (oswrch_ww),y:xand_not host_flag_our_keyboard_settings:sta (oswrch_ww),y
+
+    jsr init_table_offset_workspace_offset
+.loop
+    ldy workspace_offset:lda (oswrch_ww),y:tax
+    ldy table_offset:lda osbyte_a_table,y
+    ldy #0
+    jsr osbyte
+    dec workspace_offset
+    dec table_offset
+    bpl loop
+
+.already_user_settings
+    rts
+}
+
+
+\ Set table_offset and workspace_offset to point to the highest offset within
+\ obyte_a_table and and (oswrch_ww) relevant for the current machine.
+\
+\ On entry:
+\   Y contains host_flags_offset
+\
+\ On exit:
+\   table_offset and workspace_offset populated
+.init_table_offset_workspace_offset
+{
+    xassert_oswrch_ww_valid
+    if debug
+        cpy #host_flags_offset:beq ok:cant_happen:.ok
+    endif
+
+    \ Don't perform the Master keypad-related OSBYTE calls on a B/B+;
+    \ osbyte_set_numeric_pad_shift at least is actively harmful on a B as it
+    \ sets the byte of OS workspace indicating whether the machine has 16K or
+    \ 32K of RAM.
+    ldx #(os_settings_common_count - 1)
+    assert host_flag_master == 1<<0
+    lda (oswrch_ww),y:lsr a:bcc not_master
+    ldx #(os_settings_master_count - 1)
+.not_master
+    stx table_offset
+    txa:clc:adc #os_settings_offset:sta workspace_offset
+    rts
+}
+
+
+\ We set SHIFT+function key to generate the corresponding *KEY string; this
+\ gives the user the option to use this feature if they want. It's not available
+\ on the unshifted function keys because we trap those and use them for our own
+\ features.
+.osbyte_a_table
+    equb osbyte_set_shift_function_key_interpretation
+    equb osbyte_set_tab
+user_keyboard_auto_repeat_delay_index = P% - osbyte_a_table
+    equb osbyte_set_keyboard_auto_repeat_delay
+    equb osbyte_set_escape_status
+os_settings_common_count = (P% - osbyte_a_table)
+    equb osbyte_set_numeric_pad_base
+    equb osbyte_set_numeric_pad_shift
+    assert os_settings_master_count == (P% - osbyte_a_table)
+
+.osbyte_x_table
+    equb 1
+    equb vt102_tab
+    equb 0
+    equb 1
+    assert os_settings_common_count == (P% - osbyte_x_table)
+    equb acorn_key_keypad_base
+    equb 1
+    assert os_settings_master_count == (P% - osbyte_x_table)
+
+
+\ ROM copy of the 'OSWRCH shim'; this is not executed from the ROM but is copied
+\ to oswrch_shim_ram (with various constants patched appropriately) when we
+\ claim vectors, and WRCHV redirected to point to it. See the comment above
+\ shim_copy_loop.
+.*oswrch_shim_rom
+{
+    \ We have to save A since we will corrupt it manipulating romsel. We could
+    \ push it onto the stack, but it's faster to load it back from zero page
+    \ than to pull it from the stack. TODO: We could actually store this
+    \ directly in the operand of an LDA #xx in place of the LDA oswrch_tl at the
+    \ end of the shim. This would be neutral in terms of cycles in the shim
+    \ itself. However, we can then avoid ever stacking the caller's A - code can
+    \ just go directly to the operand of that LDA # in RAM - so I think this
+    \ would be a net win both on performance and code size. I'm not doing this
+    \ yet as it's moderately intrusive and would "commit" us a little deeper to
+    \ the use of the shim.
+    sta oswrch_tl
+
+    \ Page our ROM in
+    lda romsel_copy:sta oswrch_shim_ram_lda_original_bank+1
+.*oswrch_shim_rom_lda_our_bank
+    lda #255:sta romsel_copy:sta romsel
+
+    \ Set up oswrch_ww+1 to point to our workspace; the ROM code will set up
+    \ oswrch_ww (which is always 0). TODO: There's no need for the "STA
+    \ oswrch_ww+1" to be part of the shim; it could be the first instruction of
+    \ the ROM handler. No harm in it being here unless we're short of space for
+    \ future modifications to the shim.
+.*oswrch_shim_rom_lda_workspace_high
+    lda #255:sta oswrch_ww+1
+
+    \ Transfer control to the ROM code
+.^oswrch_shim_rom_jmp_rom_handler
+    jmp our_oswrch_bbc_b
+
+.*oswrch_shim_rom_return_from_rom_handler
+    \ The ROM code jumps back here when it's finished, with the original A in
+    \ oswrch_tl.
+
+    \ Page our ROM out
+.^oswrch_shim_rom_lda_original_bank
+    lda #255:sta romsel_copy:sta romsel
+
+    \ Restore A and we're done.
+    lda oswrch_tl
+    rts
+}
+
+oswrch_shim_size = P% - oswrch_shim_rom
+oswrch_shim_jmp_rom_handler_offset = oswrch_shim_rom_jmp_rom_handler - oswrch_shim_rom
+oswrch_shim_ram_lda_original_bank = oswrch_shim_rom_lda_original_bank - oswrch_shim_rom + oswrch_shim_ram
+
+} \ close file scope
+
+oswrch_shim_lda_our_bank_offset = oswrch_shim_rom_lda_our_bank - oswrch_shim_rom
+oswrch_shim_ram_lda_our_bank = oswrch_shim_ram + oswrch_shim_lda_our_bank_offset
+oswrch_shim_lda_workspace_high_offset = oswrch_shim_rom_lda_workspace_high - oswrch_shim_rom
+oswrch_shim_return_from_rom_handler_offset = oswrch_shim_rom_return_from_rom_handler - oswrch_shim_rom
+oswrch_shim_ram_return_from_rom_handler = oswrch_shim_ram + oswrch_shim_return_from_rom_handler_offset

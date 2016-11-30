@@ -1,0 +1,571 @@
+\ escape.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Escape/control sequence processing and dispatching
+
+{ \ open file scope
+
+\ We've seen an <ESC> character; set things up ready to process subsequent bytes
+\ of the escape/control sequence. (Note that the 'vt102' in the name is used in
+\ the sense of 'this is related to the emulated VT102', not in the sense of
+\ 'this is specific to VT102/ANSI mode'; it is used to handle <ESC> in VT52 mode
+\ as well.)
+.*vt102_escape
+{
+    xassert_oswrch_ww_valid
+
+    ldy #fast_path_flags_offset:lda (oswrch_ww),y
+    ora #fast_path_in_escape:sta (oswrch_ww),y
+
+    \ Set several workspace bytes to zero. This includes setting the first two
+    \ parameter values to 0, which allows us to avoid having to check
+    \ parameter_count in several places (but isn't necessary for the
+    \ parsing itself; inc_parameter_count_and_escape_seq_len always sets the
+    \ 'next' parameter to 0 to start with). It also sets the first byte of
+    \ pending_escape to 0, which we take advantage of in
+    \ get_first_pending_escape_character.
+    assert escape_state_offset == escape_seq_len_offset + 1
+    assert private_parameter_offset == escape_seq_len_offset + 2
+    assert pending_escape_offset == escape_seq_len_offset + 3
+    ldy #(pending_escape_offset + first_parameter_offset + 1)
+    lda #0
+.loop
+    sta (oswrch_ww),y
+    dey:cpy #escape_seq_len_offset:bcs loop
+    rts
+}
+
+
+\ VT52-specific escape sequence handling
+
+\ We're in VT52 mode, we've seen an <ESC> previously and we haven't finished
+\ processing the sequence; we've just seen another byte of the sequence.
+.in_escape_vt52_mode
+{
+    \ Pass any "filler" characters through to the regular processing.
+    tsx:lda stack+5,x \ peek character being processed from stack
+    cmp #del:beq filler
+    cmp #' ':bcs not_filler
+.filler
+    jmp process_immediate
+.not_filler
+
+    \ This is very simple as almost all the escape sequences are just <ESC>
+    \ plus a single character. The only exception is <ESC>Y; when we process
+    \ that in vt52_direct_cursor_address_incomplete we set escape_seq_len to
+    \ non-0 to indicate that we need to do further processing, and recognise
+    \ that here.
+    xassert_oswrch_ww_valid
+    ldy #escape_seq_len_offset:lda (oswrch_ww),y:bne in_escape_vt52_multi_byte
+    ldx #lo(vt52_escape_jump_table)
+    ldy #hi(vt52_escape_jump_table)
+    jmp handle_character_via_yx_and_finish_escape
+
+\ We've seen <ESC>Y (VT52 direct cursor address, incomplete).
+.^vt52_direct_cursor_address_incomplete
+    \ This is the only VT52 escape sequence longer than 2 bytes. VT52 escape
+    \ sequence processing doesn't normally record the characters seen, as we
+    \ process a character as soon as we seen it. So here we need to set
+    \ escape_seq_len to 1 so in_escape_vt52_mode will know we're part way
+    \ through this escape sequence when we receive the next character.
+    xassert_oswrch_ww_valid
+    ldy #escape_seq_len_offset:lda #1:sta (oswrch_ww),y
+
+    \ We don't actually need to store the 'Y', because nothing ever checks for
+    \ it - the fact that we're in VT52 mode and processing a multi-byte escape
+    \ sequence implies this. In debug builds, store another character where 'Y'
+    \ would go so it's more obvious if we try to check for it.
+    if debug
+        lda #42:ldy #pending_escape_offset:sta (oswrch_ww),y
+    endif
+
+    \ handle_character_via_yx_and_finish_escape has set things up so an
+    \ RTS would return to finish_escape, but that's not appropriate here,
+    \ as we are still part way through an escape sequence, so we discard that
+    \ return address and return one level up instead (which will effectively
+    \ return from our_oswrch_common_body).
+    pla:pla
+.rts
+    rts
+
+\ We've previously seen <ESC>Y, we haven't yet finished processing the command
+\ and we've just seen another byte.
+.in_escape_vt52_multi_byte
+    \ Increment escape_seq_len and store the byte in pending_escape.
+    clc:adc #1:sta (oswrch_ww),y \ increment escape_seq_len
+    xclc \ A is a valid offset into pending_escape
+    adc #pending_escape_offset-1:tay
+    tsx:lda stack+5,x \ peek character being processed from stack
+    sta (oswrch_ww),y \ store character in pending_escape
+    \ If we have now seen two additional bytes, the command is complete and we
+    \ can process it.
+    cpy #pending_escape_offset+2:bne rts
+
+    \ We've seen <ESC>Y<line><column> (VT52 direct cursor address, complete)
+    \ This would more logically belong in cursor.beebasm, but it's short and <ESC>Y
+    \ is already a special case, so it seems simplest to put it here with all the
+    \ other <ESC>Y code.
+    xassert_oswrch_ww_valid
+    vt52_xy_adjust = 31
+    lda (oswrch_ww),y:sec:sbc #vt52_xy_adjust:tax
+    dey:lda (oswrch_ww),y:sec:sbc #vt52_xy_adjust:tay
+    jsr cursor_home_xy_subroutine
+    \ Because we get here via a non-standard route, we can't RTS to transfer to
+    \ finish_escape; we have to jump there explicitly.
+    jmp finish_escape
+}
+
+
+\ VT102/ANSI-specific escape/control sequence handling (except the first few
+\ lines of in_escape)
+
+\ We've previously seen an <ESC> and we haven't yet finished processing the
+\ resulting sequence; we've just seen another byte of the sequence.
+.*in_escape
+{
+    xassert_oswrch_ww_valid
+    ldy #vt102_flags_offset:lda (oswrch_ww),y
+    and #vt102_flag_ansi_mode:beq in_escape_vt52_mode
+    \ We're in ANSI (i.e. VT102, not VT52) mode.
+
+    \ Certain characters are always processed immediately.
+    tsx:lda stack+5,x \ peek character being processed from stack
+    cmp #&20:bcc es_process_handler
+    cmp #&7f:bcs es_process_handler
+    \ Other characters are more nuanced, so we consult the state machine about
+    \ them.
+    tax
+    \ Set Y = (current) escape_state << 2
+    ldy #escape_state_offset:lda (oswrch_ww),y
+    asl a:asl a:tay
+    \ Set the two low bits of Y to the character's classification
+    cpx #'[':beq classified
+    iny
+    cpx #&30:bcc classified
+    iny
+    cpx #&40:bcc classified
+    iny
+.classified
+    \ Look up the new state (A=state_table[current_state][classification])
+    lda state_table,y
+    \ A now contains the new state; this may be one of the special states,
+    \ indicated by the top bit being set.
+    bmi special_state
+    \ We didn't see a special state, so record the character we've just
+    \ seen and the new state and then we're done with this character and can
+    \ return from OSWRCH.
+    ldy #escape_state_offset:sta (oswrch_ww),y
+    assert escape_state_offset - 1 == escape_seq_len_offset
+    dey:lda (oswrch_ww),y
+    cmp #pending_escape_size:bcs pending_escape_full
+    xclc \ bcs didn't branch
+    adc #1:sta (oswrch_ww),y
+    xclc \  A is a valid offset into pending_escape
+    adc #pending_escape_offset-1:tay
+    tsx:lda stack+5,x \ peek character being processed from stack
+    sta (oswrch_ww),y
+    rts
+
+\ We've run out of space in pending_escape. This should be very rare; it
+\ probably indicates malformed input. We don't want to act on a half-formed
+\ sequence, so we discard everything up to and including the final character.
+.^pending_escape_full
+    ldy #escape_state_offset:lda (oswrch_ww),y:tax
+    lda pending_escape_full_state_table,x
+    sta (oswrch_ww),y
+    rts
+
+\ We've seen an "ordinary" character inside the escape/control sequence; we
+\ process it immediately and remain in the same state.
+.es_process_handler
+    jmp process_immediate
+
+\ We've just seen a special state in the state machine. Some of these are
+\ terminal and the state machine is not used afterwards until another <ESC>
+\ is seen. Others just trigger a one-off special action and don't stop the
+\ processing of the current escape/control sequence. Either way, we don't
+\ update escape_state here and we don't record the character in pending_escape
+\ (although parse_parameter_character does record it in a modified form).
+.special_state
+    \ The ordering here is micro-optimised to give a small benefit to the cursor
+    \ positioning benchmark in speed.bas.
+    cmp #es_parameter:beq parse_parameter_character
+    cmp #es_control_f:beq process_control_sequence
+    cmp #es_escape_f:beq process_escape_sequence
+    cmp #es_process:beq es_process_handler
+    if debug
+    {
+        cmp #es_ignore_f:beq ok:cant_happen:.ok:cmp #es_process
+    }
+    endif
+    xbne_always finish_escape
+
+\ We've seen a complete escape sequence (as opposed to a control sequence)
+.process_escape_sequence
+    ldx #lo(escape_sequence_jump_table)
+    ldy #hi(escape_sequence_jump_table)
+    xbne_always handle_character_via_yx_and_finish_escape
+
+\ We've seen a complete control sequence (as opposed to an escape sequence)
+.process_control_sequence
+    \ I did wonder if I should check for a private parameter indicator here
+    \ and use that to select between two different jump tables for control
+    \ sequences, but I think it's probably best not to. Experimentally,
+    \ both gnome-terminal and VT100-Hax treat "ESC [ ? 0 J" exactly the same
+    \ as "ESC [ 0 J". We therefore check for a private parameter indicator
+    \ where we know it makes a difference and otherwise ignore it.
+    ldx #lo(control_sequence_jump_table)
+    ldy #hi(control_sequence_jump_table)
+    fall_through_to handle_character_via_yx_and_finish_escape
+}
+
+
+\ Take the current character (which will be the 'F' character at the end of an
+\ escape or control sequence in ANSI mode, or the first character after ESC in
+\ VT52 mode) and call the subroutine corresponding to it in the jump table
+\ pointed to by YX (doing nothing if it's unrecognised), then finish_escape.
+.handle_character_via_yx_and_finish_escape
+    stx oswrch_tl:sty oswrch_th
+    tsx:lda stack+5,x \ peek character from stack
+    jsr jump_a_via_t
+    fall_through_to finish_escape
+
+\ Control is transferred to here at the end of processing every escape
+\ sequence/control sequence; it resets the relevant state to indicate the
+\ processing is complete and returns from OSWRCH.
+.^finish_escape
+    xassert_oswrch_ww_valid
+
+    ldy #escape_seq_len_offset:lda #escape_seq_len_none:sta (oswrch_ww),y
+
+    ldy #fast_path_flags_offset:lda (oswrch_ww),y
+    xand_not fast_path_in_escape:sta (oswrch_ww),y
+
+    rts
+
+
+\ We've seen a parameter character within a control sequence.
+.parse_parameter_character
+{
+    \ If parameter_count is zero, we now know there's one parameter since
+    \ we're processing a parameter character.
+    xassert_oswrch_ww_valid
+    ldy #parameter_count_plus_one_offset:lda (oswrch_ww),y
+    cmp #2:bcs not_first_parameter_character
+    jsr inc_parameter_count_and_escape_seq_len
+.not_first_parameter_character
+
+    tsx:lda stack+5,x \ peek character being processed from stack
+    cmp #'?':beq set_private_parameter
+    cmp #';':beq separator
+    \ Anything except the above or digits is just silently ignored (and not
+    \ stored anywhere).
+    cmp #'9'+1:bcs unknown
+    cmp #'0':bcc unknown
+
+    \ It's a digit. Take the existing numeric value of the parameter,
+    \ multiply it by 10 and add this digit. (This means we don't have to
+    \ store the individual digits, we can access each parameter at a fixed
+    \ location in pending_escape and we automatically handle tricksy cases
+    \ like a massive quantity of leading '0' characters.)
+    xsec \ the previous bcc wasn't taken
+    sbc #'0':sta oswrch_uh
+    ldy #parameter_count_plus_one_offset:lda (oswrch_ww),y
+    \ We want to operate on
+    \ pending_escape+first_parameter_offset+(parameter_count-1) here,
+    \ because parameter_count is 1-based. A currently contains parameter_count.
+    xsec \ sbc didn't generate a result less than 0
+    adc #pending_escape_offset+first_parameter_offset-2-1 \ extra -1 as C is set
+    tay:lda (oswrch_ww),y
+    asl a
+    sta oswrch_ul
+    asl a:asl a
+    clc:adc oswrch_ul
+    \ A now contains the existing parameter value*10
+    clc:adc oswrch_uh:sta (oswrch_ww),y \ value=(old value*10)+new digit
+.unknown
+    rts
+
+.set_private_parameter
+    \ We've seen a private parameter indicator. We don't store this
+    \ character explicitly in pending_escape (it would mean there was no
+    \ fixed offset at which the nth parameter could be read), instead we set
+    \ a separate flag to record that we've seen this.
+    xassert_oswrch_ww_valid
+    \ We store A='?' but only because it's a handy non-0 value; the specific
+    \ value doesn't matter.
+    if debug
+    {
+        tay:bne ok:cant_happen:.ok
+    }
+    endif
+    ldy #private_parameter_offset:sta (oswrch_ww),y
+    rts
+
+.separator
+    \ We've seen a parameter separator, so increment the parameter count
+    \ and set the new parameter's byte in pending_escape to 0 ready for
+    \ subsequent digits to be accumulated. Note that we can't merge the JSR
+    \ and RTS into a JMP here as inc_parameter_count_and_escape_seq_len
+    \ will discard the return address on the stack in the case where the
+    \ pending_escape becomes full.
+    jsr inc_parameter_count_and_escape_seq_len
+    rts
+
+\ Parameters are stored in the same buffer (pending_escape) as characters
+\ being processed; we store the parameter's numeric value in a single byte
+\ instead of storing the individual ASCII characters. (There's a separate
+\ private_parameter flag to record seeing a private parameter.) We therefore
+\ need to increment both parameter_count and escape_seq_len_offset together
+\ (they are actually stored in the same place; parameter_count has only
+\ a conceptual existence). We also need to set the initial value of the
+\ parameter's byte in pending_escape to 0 ready for subsequent digits to be
+\ accumulated there.
+.inc_parameter_count_and_escape_seq_len
+    xassert_oswrch_ww_valid
+
+    \ Increment escape_seq_len, checking for pending_escape being full.
+    ldy #escape_seq_len_offset:lda (oswrch_ww),y
+    clc:adc #1
+    cmp #pending_escape_size:bcs pending_escape_full_local
+    sta (oswrch_ww),y
+
+    assert escape_seq_len_offset == parameter_count_plus_one_offset
+    \ A contains the incremented parameter_count+1
+    \ Set the value of the Ath parameter in pending_escape to 0; this is located
+    \ at (oswrch_ww)+pending_escape_offset+first_parameter_offset+(A-1)-1 as the
+    \ parameter numbering is 1-based.
+    xclc
+    adc #(pending_escape_offset+first_parameter_offset-1-1):tay
+    lda #0:sta (oswrch_ww),y
+    rts
+
+.pending_escape_full_local
+    pla:pla \ discard the return address since we aren't going to RTS
+    jmp pending_escape_full
+} 
+
+
+\ Compare the byte in A against a jump table held at T. This is intended to be
+\ entered via JSR. If a match is found, control will transfer as if via JMP
+\ to the handler and when it does an RTS control will return to the caller
+\ of this subroutine. If no match is found control will return immediately;
+\ no means of distinguishing these two returns is provided.
+\
+\ The jump table has the form:
+\     equb byte_to_match:equh handler_address
+\     ...
+\     equb top_bit
+\ and cannot be larger than 256 bytes. 
+\
+\ Preserves: X, all zero page except UL
+.*jump_a_via_t
+{
+    sta oswrch_ul
+    ldy #0
+.loop
+    lda (oswrch_t),y:bmi rts
+    iny
+    cmp oswrch_ul:beq match
+    iny:iny:xbne_always loop
+.match
+    \ Transfer control to the handler using RTS
+    lda (oswrch_t),y:pha
+    iny:lda (oswrch_t),y:pha
+.rts
+    rts
+}
+
+
+\ Return with the first character in pending_escape in A, or 0 if there is
+\ no such character. The flags reflect the value in A on exit.
+\
+\ This is really only useful when processing escape (not control) sequences
+\ and effectively returns the first 'I' character.
+\
+\ Preserves: X
+.*get_first_pending_escape_character
+{
+    xassert_oswrch_ww_valid
+    \ vt102_escape initialises the first byte of pending_escape to 0, so we
+    \ don't need to check escape_seq_len is non-0.
+    ldy #pending_escape_offset:lda (oswrch_ww),y
+    rts
+}
+
+
+\ If there's at least one parameter, return with A=max(min(1, first parameter),
+\ 80), otherwise return with A=1. The flags *do not* reflect the value in
+\ A on exit.
+\
+\ This is intended for use where the parameter is to be used to specify a
+\ quantity related to characters/lines, where no parameter means the same
+\ as specifying a parameter of 1 and values over 80 may cause internal
+\ calculations to overflow and would have indistinguishable user-visible
+\ effects from a value of 80 anyway.
+\
+\ Preserves: X
+.*get_constrained_first_parameter_in_a 
+{
+    xassert_oswrch_ww_valid
+    \ If parameter_count is 0, first_parameter will also be 0, so we don't
+    \ need to explicitly check parameter_count.
+    ldy #pending_escape_offset+first_parameter_offset:lda (oswrch_ww),y
+    beq is_zero
+    cmp #81:bcc rts
+    lda #80
+    rts
+.is_zero
+    lda #1
+.rts
+if debug
+    ldy #42 \ corrupt flags
+endif
+    rts
+}
+
+
+\ If there's at least one parameter, return with it in A, otherwise return with
+\ A=0. The flags reflect the value in A on exit.
+\
+\ Because the parameter is returned unmodified, it can have any 8-bit value.
+\ This is fine if the caller is simply going to compare it against a fixed set
+\ of values, but if it's going to be used as some kind of count the caller must
+\ take care to avoid problems if the value is "extreme"; it may be better to use
+\ get_constrained_first_parameter_in_a instead.
+\
+\ Preserves: X
+.*get_raw_first_parameter_in_a
+{
+    xassert_oswrch_ww_valid
+    \ If parameter_count is 0, first_parameter will also be 0, so we don't need
+    \ to explicitly check parameter_count.
+    ldy #pending_escape_offset+first_parameter_offset:lda (oswrch_ww),y
+    rts
+}
+
+
+\ TODO: We could micro-optimise by ordering this so the most common ones
+\ come towards the start. (Or we could start to do a binary search on the
+\ jump table!)
+.control_sequence_jump_table
+    equb '@':equh insert_character
+    equb 'A':equh cursor_up
+    equb 'B':equh cursor_down
+    equb 'C':equh cursor_forward
+    equb 'D':equh cursor_backward
+    equb 'H':equh cursor_home
+    equb 'J':equh erase_in_display
+    equb 'K':equh erase_in_line
+    equb 'L':equh insert_line
+    equb 'M':equh delete_line
+    equb 'P':equh delete_character
+    equb 'c':equh device_attributes
+    equb 'f':equh cursor_home
+    equb 'g':equh tabulation_clear
+    equb 'h':equh set_mode
+    equb 'l':equh reset_mode
+    equb 'm':equh select_graphic_rendition
+    equb 'n':equh report
+    equb 'r':equh set_margins
+    \ TODO: We don't support Load LED (DECLL); trying to override the OS's use
+    \ of SHIFT LOCK seems like a bad idea, using the cassette motor LED would
+    \ only work on the B/B+ and would potentially wear out the relay and
+    \ indicating on this on the screen somehow seems error prone (especially
+    \ when we support using the full screen for text output).
+    equb top_bit
+.control_sequence_jump_table_end
+if (control_sequence_jump_table_end - control_sequence_jump_table) > 255
+    error "control_sequence_jump_table too large"
+endif
+
+.escape_sequence_jump_table
+    equb '0':equh select_character_set_special
+    equb '1':equh select_character_set_alternate
+    equb '2':equh select_character_set_alternate_special
+    equb '3':equh double_height_line_top
+    equb '4':equh double_height_line_bottom
+    equb '5':equh single_width_line
+    equb '6':equh double_width_line
+    equb '7':equh save_cursor_attrs
+    equb '8':equh decrc_or_decaln
+    equb '=':equh application_keypad_mode
+    equb '>':equh numeric_keypad_mode
+    equb 'A':equh select_character_set_uk
+    equb 'B':equh select_character_set_us
+    equb 'D':equh index
+    equb 'H':equh horizontal_tabulation_set
+    equb 'E':equh next_line
+    equb 'M':equh reverse_index
+    equb 'N':equh single_shift_2
+    equb 'O':equh single_shift_3
+    equb 'Z':equh ansi_identify_terminal
+    equb 'c':equh reset_initial_state
+    equb top_bit
+.escape_sequence_jump_table_end
+if (escape_sequence_jump_table_end - escape_sequence_jump_table) > 255
+    error "escape_sequence_jump_table too large"
+endif
+
+.vt52_escape_jump_table
+    equb '<':equh vt52_ansi_mode
+    equb '=':equh application_keypad_mode
+    equb '>':equh numeric_keypad_mode
+    equb 'A':equh vt52_cursor_up
+    equb 'B':equh vt52_cursor_down
+    equb 'C':equh vt52_cursor_right
+    equb 'D':equh vt52_cursor_left
+    equb 'F':equh vt52_enter_graphics_mode
+    equb 'G':equh vt52_exit_graphics_mode
+    equb 'H':equh vt52_cursor_home
+    equb 'I':equh vt52_reverse_linefeed
+    equb 'K':equh vt52_erase_to_end_of_line
+    equb 'J':equh vt52_erase_to_end_of_screen
+    equb 'Y':equh vt52_direct_cursor_address_incomplete
+    equb 'Z':equh vt52_identify
+    \ TODO: The VT52 user guide lists ESC [ and ESC \ to enter and exit
+    \ hold-screen mode; the VT102 user guide doesn't list these, so they are
+    \ probably (I haven't checked) not supported by a VT102 emulating a VT52.
+    \ Hold-screen mode sounds quite similar to the Acorn paged mode, so it may
+    \ be a worthwhile/interesting extension to support something like it in both
+    \ VT52 and VT102 mode, perhaps allowing a function key to toggle it on/off
+    \ as well as supporting these VT52 codes, and using SHIFT to do the "scroll
+    \ new screen" behaviour (we'd probably want another function key for the
+    \ "scroll one line" behaviour).
+    equb top_bit
+.vt52_escape_jump_table_end
+if (vt52_escape_jump_table_end - vt52_escape_jump_table) > 255
+    error "vt52_escape_jump_table too large"
+endif
+
+
+\ State tables used to interpret ANSI escape/control sequences
+\
+\ Notes:
+\ - characters in range &30-&3f are 'P' characters in control sequences and 'F'
+\   characters in escape sequences
+\ - state 0: seen ESC
+\ - state 1: control sequence, accepting P/I/F
+\ - state 2: control sequence, accepting I/F
+\ - state 3: control sequence error state, discarding everything up to and including F
+\ - state 4: escape sequence, accepting I/F
+\ - state 5: escape sequence error state, discarding everything up to and including F
+\
+\ Primary state table, used to convert (character class, current state) -> new state
+.state_table
+        \ Character class                                       Current
+        \ 0 ('[')    1 (&20-&2f)  2 (&30-&3f)      3 (&40-&7e)  state
+        \            ('I' chars)  ('P'/'F' chars)  ('F' chars)
+equb    1,           4,           es_escape_f,     es_escape_f  \ 0
+equb    es_ignore_f, 2,           es_parameter,    es_control_f \ 1
+equb    es_ignore_f, 2,           3,               es_ignore_f  \ 2
+equb    3,           3,           3,               es_ignore_f  \ 3
+equb    es_ignore_f, 4,           es_escape_f,     es_escape_f  \ 4
+equb    5,           5,           es_ignore_f,     es_ignore_f  \ 5
+
+} \ close file scope

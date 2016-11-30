@@ -1,0 +1,29 @@
+\ header.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Sideways ROM header
+
+{ \ open file scope
+
+assert P% == &8000
+
+.*rom_header
+    equw 0:equb 0			\ language entry
+    jmp service_entry			\ service entry
+    equb %10000010			\ ROM type byte (6502 service ROM)
+    equb copyright_string - rom_header  \ copyright offset pointer
+    equb version_binary			\ binary version number
+    name				\ title
+    equb 0				\ version string prefix
+    version_text:version_date		\ version string
+.copyright_string
+    equb 0
+    copyright
+    equb 0          
+
+} \ close file scope

@@ -1,0 +1,387 @@
+\ workspace.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ This file allocates space in the ROM image to use as workspace when running
+\ from sideways RAM. This also defines the layout of the workspace used when
+\ we're not running from sideways RAM, as the offsets of the various fields 
+\ are calculated here. (Every location is defined with a 0 value here; this is
+\ actually irrelevant, as we zero out the workspace at runtime.)
+
+\ We assume the workspace is page-aligned in several places; this is always true
+\ when we're not running from sideways RAM, and so we need to be consistent
+\ here.
+.information \ see the end of this file
+align 256
+
+.swr_workspace
+\ It's important that the first byte of workspace can't be accessed from within
+\ an interrupt handler; see the comment in workspace-manager.beebasm's
+\ ne_iff_sideways_ram subroutine. The line attributes are perfect here, as
+\ they're only used from within our OSWRCH handler.
+
+\ Line attributes. We make these the first things in the first page of
+\ workspace so that we can use (zp),Y access with Y=line number to retrieve them.
+.swr_line_attributes
+assert swr_line_attributes = swr_workspace
+for i, 1, max_screen_lines
+    equb 0
+next
+
+\ A note on naming: A byte 'foo' of workspace is usually access via LDY
+\ #foo_offset:LDA (oswrch_ww),Y or similar. Comments typically refer to
+\ 'foo' rather than 'foo_offset' for convenience.
+
+\ Flags byte used to record various properties of the machine we're running on
+\ (as opposed to properties of the emulated terminal); see the host_flag_*
+\ constants.
+.swr_host_flags equb 0
+host_flags_offset = swr_host_flags - swr_workspace
+
+\ Flags byte to track various user options; see the user_option_* constants.
+.swr_user_options equb 0
+user_options_offset = swr_user_options - swr_workspace
+
+\ If this is 0 the emulation is enabled, otherwise the bits defined by the
+\ emulation_disabled_* constants indicate why it's disabled.
+.swr_emulation_disabled equb 0
+emulation_disabled_offset = swr_emulation_disabled - swr_workspace
+
+\ Number of lines on the Acorn screen in the current screen mode
+.swr_acorn_screen_lines equb 0
+acorn_screen_lines_offset = swr_acorn_screen_lines - swr_workspace
+
+\ Number of lines on the emulated screen; this is min(acorn_screen_lines,
+\ requested_screen_lines) and is re-evaluated on Acorn mode changes or
+\ when the user changes requested_screen_lines. If this is smaller than
+\ acorn_screen_lines, the extra lines are blank (so we can perform hardware
+\ scrolling without worrying about the extra lines).
+.swr_emulated_screen_lines equb 0
+emulated_screen_lines_offset = swr_emulated_screen_lines - swr_workspace
+
+\ Last Acorn control character seen
+.swr_last_acorn_control_character equb 0
+last_acorn_control_character_offset = swr_last_acorn_control_character - swr_workspace
+
+\ Number of bytes in escape sequence seen so far; escape_seq_len_none if
+\ we haven't seen <ESC>, 0 if we've seen <ESC> but no following bytes,
+\ 1 if we've seen <ESC> and one following byte, etc.
+.swr_escape_seq_len equb 0
+escape_seq_len_offset = swr_escape_seq_len - swr_workspace
+\ Only control sequences have parameters, and because the first byte of
+\ pending_escape is used for the '[' in a control sequence, escape_seq_len is
+\ effectively parameter_count+1.
+parameter_count_plus_one_offset = escape_seq_len_offset
+
+\ Current state of state machine used to process escape sequences. Only
+\ relevant if escape_seq_len != escape_seq_len_none.
+.swr_escape_state equb 0
+escape_state_offset = swr_escape_state - swr_workspace
+
+\ private_parameter is 0 if we haven't seen an ANSI escape sequence private
+\ parameter indicator, non-0 if we have.
+.swr_private_parameter equb 0
+private_parameter_offset = swr_private_parameter - swr_workspace
+
+\ pending_escape is used to store the escape or control sequence being
+\ received. It contains escape_seq_len bytes. Its structure will vary:
+\
+\ - If we're processing a VT52 <ESC>Y command it will contain 'Y' followed by
+\   the two parameter bytes.
+\
+\ - If we're processing an escape (not control) sequence, it contains all the
+\   intermediate characters seen after the <ESC> but not including the
+\   final character
+\
+\ - If we're processing a control sequence, the first byte is '['. The
+\   following parameter_count (which may be zero) bytes contain the numeric
+\   values of the parsed parameter characters. (We don't permit intermediate
+\   characters in a control sequence any more; previously they would appear in
+\   pending_escape after the numeric parameter values.) The final character
+\   is not present in pending_escape. Any private parameter indicator is not
+\   stored in here (it would mean the parameters themselves didn't have a fixed
+\   offset (first_parameter_offset) from the start of the buffer); instead
+\   the private_parameter flag is set if we see a private parameter indicator.
+pending_escape_size = 10 \ somewhat arbitrarily sized
+.swr_pending_escape
+for i, 1, pending_escape_size
+    equb 0
+next
+pending_escape_offset = swr_pending_escape - swr_workspace
+if debug
+    .swr_pending_escape_canary equb 0
+    pending_escape_canary_offset = swr_pending_escape_canary - swr_workspace
+endif
+
+\ Flags byte to track various modes in the emulated VT102; see the vt102_flag_*
+\ constants.
+.swr_vt102_flags equb 0
+\ Partial copy - see vt102_flags_save_mask - of vt102_flags taken by
+\ save_cursor_attrs and restored by restore_cursor_attrs.
+.swr_saved_vt102_flags equb 0
+vt102_flags_offset = swr_vt102_flags - swr_workspace
+saved_vt102_flags_offset = swr_saved_vt102_flags - swr_workspace
+
+\ Flags byte used to track whether or not the fast path can be used; see the
+\ fast_path_* constants.
+.swr_fast_path_flags equb 0
+\ Partial copy - see fast_path_flags_save_mask - of fast_path_flags taken by
+\ save_cursor_attrs and restored by restore_cursor_attrs.
+.swr_saved_fast_path_flags equb 0
+fast_path_flags_offset = swr_fast_path_flags - swr_workspace
+saved_fast_path_flags_offset = swr_saved_fast_path_flags - swr_workspace
+
+\ Start of attributes saved/restored by {save,restore}_cursor_attrs
+.swr_attribute_block_start
+
+\ Current logical cursor position of the emulated VT102 cursor; logical
+\ means that each character occupies one position, regardless of whether
+\ it's on a double or single width line.
+.swr_vt102_logical_cursor_x equb 0
+vt102_logical_cursor_x_offset = swr_vt102_logical_cursor_x - swr_workspace
+.swr_vt102_cursor_y equb 0
+vt102_cursor_y_offset = swr_vt102_cursor_y - swr_workspace
+
+\ Current character attributes; see the character_attribute_* constants
+.swr_current_character_attributes equb 0
+current_character_attributes_offset = swr_current_character_attributes - swr_workspace
+
+\ Current character set pointer; see the character_set_pointer_* constants
+.swr_current_character_set_pointer equb 0
+current_character_set_pointer_offset = swr_current_character_set_pointer - swr_workspace
+
+\ Single shift 2/3 select G2/G3 character set pointer for a single
+\ character, so we need to record the previous character set pointer so we
+\ can switch back afterwards. The need to switch back is recorded by the
+\ fast_path_temporary_character_set_pointer flag.
+.swr_pending_character_set_pointer equb 0
+pending_character_set_pointer_offset = swr_pending_character_set_pointer - swr_workspace
+
+\ This array records which character set is selected by each of the character
+\ set pointers; it's indexed by the character_set_pointer_* constants.
+.swr_character_set_pointers
+character_set_pointers_size = 5
+    for i, 1, character_set_pointers_size
+        equb 0
+    next
+character_set_pointers_offset = swr_character_set_pointers - swr_workspace
+
+\ End of attributes saved/restored by {save,restore}_cursor_attrs; actually
+\ it's a few bytes earlier, as we currently only save character set pointers
+\ G0 and G1 on save/restore cursor attributes. TODO: If we allow G2,
+\ G3 and/or the VT52 graphics character set pointers to be varied via
+\ escape sequences, we should save them here and of course restore them
+\ in restore_cursor_attrs. If they can only be set via * commands then we
+\ probably don't need to save them here.
+assert character_set_pointer_g0 == 0
+assert character_set_pointer_g1 == 1
+swr_attribute_block_end = swr_character_set_pointers + 2
+
+attribute_block_offset = swr_attribute_block_start - swr_workspace
+attribute_block_size = swr_attribute_block_end - swr_attribute_block_start
+\ Nothing depends on attribute_block_size having this precise value, but this
+\ assertion will catch accidental moves of data into and out of attribute_block.
+assert attribute_block_size == 7
+
+\ Space to save a copy of the attributes between attribute_block_start and
+\ attribute_block_end, used by {save,restore}_cursor_attrs.
+.swr_attribute_save_block
+    for i, 1, attribute_block_size
+        equb 0
+    next
+attribute_save_block_offset = swr_attribute_save_block - swr_workspace
+
+\ Top and bottom margins; S0B *inclusive* line numbers.
+.swr_top_margin equb 0
+top_margin_offset = swr_top_margin - swr_workspace
+.swr_bottom_margin equb 0
+bottom_margin_offset = swr_bottom_margin - swr_workspace
+
+\ This space is used to hold a character bitmap when we need to work with a copy
+\ in RAM.
+.swr_bitmap
+for i, 1, 8
+    equb 0
+next
+bitmap_offset = swr_bitmap - swr_workspace
+
+\ We represent the tab stops as bits set within 80 bits (10 bytes). Within
+\ each byte, bit 0 represents the lowest-numbered column.
+.swr_tab_stops
+for x, 1, 80/8
+    equb 0
+next
+tab_stops_offset = swr_tab_stops - swr_workspace
+
+\ We use our own keyboard buffer instead of the OS keyboard buffer. This is a
+\ circular buffer containing input_buffer_total_size bytes; we have a front
+\ pointer (where reads occur) and a back pointer (where writes occur). The
+\ space is conceptually subdivided into normal and priority space; ordinary
+\ user input can only be inserted if there's a normal space available, while
+\ input generated by the emulation in request to an escape sequence such as
+\ Cursor Position Report is allowed to use the priority space, as are the
+\ second and subsequent bytes of multi-byte escape sequences generated for
+\ keypresses. This is done to minimise the risk of an application requesting
+\ a response and not receiving it as the buffer is full of input from the
+\ actual keyboard, or seeing a partial escape sequence.
+input_buffer_normal_size = 32 \ somewhat arbitrarily sized
+\ We size the priority space to accommodate the longest possible query response
+\ (see cursor_position_report) plus two bytes of a three-byte "ordinary key"
+\ escape sequence (see apply_map)
+input_buffer_priority_size = 8 + 2 
+input_buffer_total_size = input_buffer_normal_size + input_buffer_priority_size
+.swr_input_buffer
+for i, 1, input_buffer_total_size
+    equb 0
+next
+if debug
+    .swr_input_buffer_canary equb 0
+    input_buffer_canary_offset = swr_input_buffer_canary - swr_workspace
+endif
+input_buffer_offset = swr_input_buffer - swr_workspace
+
+\ Number of bytes of normal space free in input_buffer.
+.swr_input_buffer_normal_free equb 0
+input_buffer_normal_free_offset = swr_input_buffer_normal_free - swr_workspace
+
+\ Number of bytes of priority space free in input_buffer
+.swr_input_buffer_priority_free equb 0
+input_buffer_priority_free_offset = swr_input_buffer_priority_free - swr_workspace
+
+\ Front pointer for input_buffer; this points to the first character to be read
+\ from the buffer (if input_buffer_normal_free+input_buffer_priority_free isn't 
+\ 0).
+.swr_input_buffer_front equb 0
+input_buffer_front_offset = swr_input_buffer_front - swr_workspace
+
+\ Back pointer for input_buffer; this points to the first free space (if
+\ input_buffer_normal_free+input_buffer_priority_free is less than
+\ input_buffer_total_size).
+.swr_input_buffer_back equb 0
+input_buffer_back_offset = swr_input_buffer_back - swr_workspace
+
+\ Copies of the original vector handlers before we installed our own, for
+\ chaining on to and for restoring when we're disabled. The labels within here
+\ must be in the same order as the vectors in our_vector_table.
+.swr_parent_vector
+parent_vector_offset = swr_parent_vector - swr_workspace
+.swr_old_insv equw 0 \ parent INSV handler
+old_insv_offset = swr_old_insv - swr_workspace
+.swr_old_remv equw 0 \ parent REMV handler
+old_remv_offset = swr_old_remv - swr_workspace
+.swr_old_cnpv equw 0 \ parent CNPV handler
+old_cnpv_offset = swr_old_cnpv - swr_workspace
+.swr_old_wrchv equw 0 \ parent WRCHV handler
+old_wrchv_offset = swr_old_wrchv - swr_workspace
+assert P% - swr_parent_vector == our_vector_count * 2
+
+\ The address of the 3-byte group in the stored screen containing the character
+\ at the current cursor position; if there is no stored screen, the high byte of
+\ this will be 0. This is used to save work in the fast path.
+.swr_stored_screen_cursor_address equw 0
+stored_screen_cursor_address_offset = swr_stored_screen_cursor_address - swr_workspace
+
+\ The address of the 3-byte group in the stored screen containing the first
+\ character on the current cursor line; if there is no stored screen, the high
+\ byte of this will be 0. This is used to save work in the fast path.
+.swr_stored_screen_cursor_line_address equw 0
+stored_screen_cursor_line_address_offset = swr_stored_screen_cursor_line_address - swr_workspace
+
+\ The address of the character at the current cursor position in the video RAM.
+\ This is used to save work in the fast path.
+.swr_video_ram_cursor_address equw 0
+video_ram_cursor_address_offset = swr_video_ram_cursor_address - swr_workspace
+
+\ The address of the first character on the current cursor line in the video
+\ RAM. This is used to save work in the fast path.
+.swr_video_ram_cursor_line_address equw 0
+video_ram_cursor_line_address_offset = swr_video_ram_cursor_line_address - swr_workspace
+
+\ Pointer to a key map used to translate internal Acorn cursor key codes into
+\ the appropriate escape sequences for the current terminal mode; see apply_map.
+.swr_cursor_key_map equw 0
+cursor_key_map_offset = swr_cursor_key_map - swr_workspace
+
+\ Pointer to a key map used to translate internal 'VT102 keypad' codes into the
+\ appropriate escape sequences for the current the terminal mode; see apply_map.
+.swr_keypad_key_map equw 0
+keypad_key_map_offset = swr_keypad_key_map - swr_workspace
+
+\ No scroll flag; if this is non-0, no scroll mode is enabled and OSWRCH will
+\ block instead of scrolling.
+.swr_no_scroll_offset equb 0
+no_scroll_offset = swr_no_scroll_offset - swr_workspace
+
+\ Keypad emulation flag; if this is non-0, part of the main Acorn keyboard is
+\ used to emulate the VT102 keypad.
+.swr_keypad_emulation equb 0
+keypad_emulation_offset = swr_keypad_emulation - swr_workspace
+
+\ This is the stored screen equivalent of screen_top_line_address for the video
+\ RAM; it identifies the line within the stored screen which corresponds to line
+\ 0 on the display.
+.swr_stored_screen_start_line equb 0
+stored_screen_start_line_offset = swr_stored_screen_start_line - swr_workspace
+
+\ set_our_keyboard_settings saves the previous values of some OS settings it
+\ modifies here; this allows set_user_keyboard_settings to restore them later.
+.swr_os_settings
+os_settings_master_count = 6
+for i, 1, os_settings_master_count
+    equb 0
+next
+os_settings_offset = swr_os_settings - swr_workspace
+
+\ We'd probably get errors anyway if the "miscellaneous workspace" exceeded a
+\ page (e.g. LDY #foo_offset would fail) but let's be paranoid in case we ever
+\ have a multi-byte object at the end of workspace which wraps over into the
+\ following page.
+assert P% - swr_workspace <= 256
+align 256
+small_workspace_size = P% - swr_workspace
+.swr_stored_screen
+stored_screen_offset = swr_stored_screen - swr_workspace
+\ We rely on the stored screen starting one page into the workspace.
+assert stored_screen_offset == 256
+for i, 1, stored_line_len_bytes * max_screen_lines
+    equb 0
+next
+.swr_stored_screen_end
+stored_screen_size = swr_stored_screen_end - swr_stored_screen
+\ We rely on the stored screen taking an exact number of pages when we perform
+\ wrapping.
+assert lo(stored_screen_size) == 0
+\ We don't rely on it taking exactly 15 pages as such, but this is so fundamental
+\ that if it somehow changes something's probably gone wrong.
+assert hi(stored_screen_size) == 15
+
+\ We put some information in the unused area of the ROM before the workspace and
+\ running into the workspace if necessary; this is not used at run time so can
+\ be overwritten with impunity. It is intended only for viewing in a hex dump of
+\ the ROM image on disc, for support/debugging purposes.
+clear information, P%
+org information
+macro xequs_bool b
+    if b
+        equs "TRUE"
+    else
+        equs "FALSE"
+    endif
+endmacro
+    equs "debug="
+    xequs_bool debug
+    equs 13, "fast_path_enabled="
+    xequs_bool fast_path_enabled
+    equs 13, "alignment_assertions_enabled="
+    xequs_bool alignment_assertions_enabled
+    equs 13, "assembled_at=", TIME$, 13
+    equs 13 \ blank line separating the above from the following fluff
+    equs "Share and Enjoy!", 13
+
+\ This also leaves P% immediately after the last byte of the ROM which it's
+\ useful to save, so the ROM image isn't any longer than necessary, saving
+\ disc space and speeding up loading.

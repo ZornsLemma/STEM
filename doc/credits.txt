@@ -1,0 +1,29 @@
+Thanks to Jonathan Graham Harston, "sweh", "danielj", "1024MAK", "RobC", Rich
+Talbot-Watkins, Tom Seddon, Matt Godbolt, Richard Toohey, "tricky", "hoglet",
+"trixster", "Coeus" and "CMcDougall" for help and advice on several points (via
+the stardot.org.uk and retrosoftware.co.uk forums) while I was writing this. My
+apologies to anyone I've forgotten to mention!
+
+vttest was extremely helpful in validating the behaviour of the emulator (and
+many of the test cases included are derived from it; see LICENCE.txt for more
+details).
+
+The code to page shadow RAM in and out is based on
+http://beebwiki.mdfs.net/Paging_in_video_memory
+
+VT100-Hax (https://github.com/phooky/VT100-Hax) was useful for testing out some
+aspects of the behaviour of the original VT100 terminal.
+
+http://software.schmorp.de/pkg/vt102.html was useful for testing out some
+aspects of the behaviour of the original VT102 terminal.
+
+The idea of representing "N" as a lower-case "n" (inverted-"U") in the "NL"
+special character bitmap (character 104/&68/0150) is based on asciimario's 3x5
+pixel font: http://fontstruct.com/fontstructions/show/716744/3_by_5_pixel_font
+
+The demonstration VT100 animations were taken from
+http://artscene.textfiles.com/vt100/
+
+The BeebAsm assembler used to write STEM has helped to make it a pleasant
+experience; the scoped labels in particular are great for modularising a large
+code base.

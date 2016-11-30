@@ -1,0 +1,638 @@
+\ service.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ OS service call handler
+
+{ \ open file scope
+
+\ *HELP support
+\ This code is in a slightly illogical order to allow branch targets to be
+\ within range; start reading at help_handler.
+{
+.print_title_and_version
+    jsr print_inline
+    equb cr
+    name
+    equs ' '
+    version_text
+    equb top_bit or cr
+    rts
+
+.help_table
+    name
+    xequw_be &8002
+    equb 0
+
+argument_seen_flag = transient_zp
+table_ptr = transient_zp
+
+.arguments_seen
+    inc argument_seen_flag
+    \ X=1 => argument not recognised, so check the next argument
+    dex:beq check_next_help_argument
+    \ (original) X=2 => our argument seen
+    jsr print_title_and_version
+    \ command_table includes separate entries for *VT52 and *VT102, but we
+    \ want to show them in the help as a single command (to avoid duplicating
+    \ the huge list of arguments), so we manually fudge the output from
+    \ command_table a bit.
+    jsr print_inline
+    equs "  VT52/10", top_bit or '2'
+    lda #lo(command_table_help_start):sta table_ptr
+    lda #hi(command_table_help_start):sta table_ptr+1
+    ldy #0
+    xbeq_always loop2
+.loop
+    lda #' ':jsr oswrch:jsr oswrch
+.loop2
+    lda (table_ptr),y
+    bmi skip_handler
+    jsr osasci
+    inc table_ptr:bne loop2
+    inc table_ptr+1:xbne_always loop2
+.skip_handler
+    jsr osnewl
+    \ We use Y to skip these; this works in conjunction with our advancing of
+    \ table_ptr and won't be a problem unless we have >=128 different commands.
+    iny:iny
+    lda (table_ptr),y
+    bne loop
+.done
+    \ Note that we don't handle the call even though we recognised the keyword;
+    \ this is particularly important if an abbreviation was used (e.g. "*HELP
+    \ S." should show "*HELP SRAM" and "*HELP STEM").
+.*unstack_axy_service_call_not_handled
+    pla:tay
+    pla:tax
+    pla
+    rts
+
+\ Preserves: A, X, Y
+.^help_handler
+    pha
+    txa:pha
+    tya:pha
+    lda #0:sta argument_seen_flag
+    sty parser_command_y
+.check_next_help_argument
+    ldx #lo(help_table)
+    ldy #hi(help_table)
+    lda #0
+    jsr parse_next_argument
+    txa:bne arguments_seen
+    \ X=0 => no *HELP arguments left
+    \ If we never saw any arguments (i.e. there were none, rather than there were
+    \ some but we didn't recognise any), add our contribution to the output.
+    lda argument_seen_flag:bne unstack_axy_service_call_not_handled
+    jsr print_title_and_version
+    jsr print_inline
+    equs "  "
+    name
+    equb top_bit or cr
+    jmp unstack_axy_service_call_not_handled
+}
+
+
+\ On entry:
+\   A is the service type
+\   X is our ROM number
+\   Y is the service parameter (if any)
+\
+\ On exit:
+\   A, X, Y preserved if service call not claimed
+\   A = 0 if service call claimed
+.*service_entry
+{
+    rts_if_rom_disabled
+
+    cmp #service_offer_low_dynamic_workspace:beq workspace_handler_offer_low_dynamic_workspace_indirect
+    cmp #service_offer_high_dynamic_workspace:beq workspace_handler_offer_high_dynamic_workspace_indirect
+    cmp #service_count_high_dynamic_workspace:beq workspace_handler_count_high_dynamic_workspace_indirect
+    cmp #service_command:beq command_handler
+    cmp #service_help:beq help_handler
+    rts
+
+.workspace_handler_offer_low_dynamic_workspace_indirect
+    jmp workspace_handler_offer_low_dynamic_workspace
+.workspace_handler_offer_high_dynamic_workspace_indirect
+    jmp workspace_handler_offer_high_dynamic_workspace
+.workspace_handler_count_high_dynamic_workspace_indirect
+    jmp workspace_handler_count_high_dynamic_workspace
+}
+
+
+\ Preserves: A, X, Y
+.command_handler
+{
+    pha
+    txa:pha
+    tya:pha
+
+    sty parser_command_y 
+    lda #2 \ * command parsing
+    ldx #lo(command_table)
+    ldy #hi(command_table)
+    jsr parse_next_argument
+    \ Transfer control to YX+1 using the RTS trick, unless Y is zero in which
+    \ case the lookup failed, so we return without claiming the service call.
+    tya:bpl unstack_axy_service_call_not_handled
+    pha
+    txa:pha
+    \ Before transferring control we load Y from parser_command_y so it's ready
+    \ for the specific command handler to parse any arguments.
+    ldy parser_command_y
+    rts \ transfer control to command-specific handler
+}
+
+\ Table used by parse_next_argument to recognise * commands; also used to
+\ generate the *HELP STEM output.
+.command_table
+    equs "XYZZY":equh command_xyzzy
+    equs "VT102":equh command_vt102
+    equs "VT52"
+\ We use the command table to output the *HELP STEM output, but as we just want
+\ to show "*VT52/102" as a single command we need to fudge it a bit and use
+\ this special entry point.
+.command_table_help_start
+    \ The syntax indicated here is not strictly correct - you are at liberty to
+    \ specify both DECUS and ACORNUS, for example - but I think this is the most
+    \ useful concise summary, as it shows the available options and the ones
+    \ which are alternates to each other. The default appears first in each
+    \ group.
+    equs " (32/25/24) (STRICT) (ON/OFF)", cr
+    equs "    (ACORNUS/DECUS) (DEL/NODEL)", cr
+    equs "    (HYBRID/PURE) (GAPPY/GAPLESS)", cr
+    equs "    (STORED/NOSTORED)"
+    equh command_vt52
+    name
+    equs " (SMALL/LARGE/OFF/STATUS)":equh command_stem
+    equs "REDRAW":equh command_redraw
+    equb 0
+
+
+\ *XYZZY command
+.command_xyzzy
+{
+    jsr print_inline:equs "Nothing happens", top_bit or cr
+    jmp unstack_axy_service_call_handled
+}
+
+
+{
+\ Table of arguments supported by *STEM, used with parse_next_argument.
+\ TODO: It might be good to reorder these, probably to have STATUS first;
+\ currently "*STEM ." effectively does "*STEM LARGE", which is not ideal.
+.stem_table
+    equb "LARGE",  &80, rom_workspace_byte_want_large
+    equb "SMALL",  &80, rom_workspace_byte_want_small
+    equb "OFF",    &80, rom_workspace_byte_want_none
+    equb "STATUS", &80, 0
+    equb 0
+
+\ *STEM command; used to control the size of workspace claimed on reset and to
+\ show the emulation status.
+.^command_stem
+    lda #0
+    sty parser_command_y 
+    ldx #lo(stem_table)
+    ldy #hi(stem_table)
+    jsr parse_next_argument
+    tya:bne not_special
+    \ X is either 0 for no argument or 1 for unrecognised argument
+    txa:bne bad_command
+    \ There's no argument, which means "SMALL". It seems a bad idea for this
+    \ to vary in meaning depending on the environment we're running in, and
+    \ defaulting to "LARGE" is inviting the user to shoot themselves in the
+    \ foot by doing *STEM then attempting to use a Z80 second processor on
+    \ a B/B+ with PAGE at &1900 before STEM claims any workspace. (The Z80
+    \ uses memory at &2500 upwards in the host.) It's a bit of a shame that
+    \ when running from sideways RAM this gives small workspace when large
+    \ workspace has no real downside (except for a bit of speed), but a)
+    \ I think consistency is preferable b) in sideways RAM you don't need
+    \ to do *STEM at all.
+    lda #rom_workspace_byte_want_small:pha
+.only_one_argument
+    pla:beq stem_status
+    \ Everything except *STEM STATUS turns the emulation off; the complexities
+    \ of the private workspace byte mean that we can't always leave it on while
+    \ recording the user's new choice, and it seems difficult and probably
+    \ confusing for the user to try to turn it off only when we have to.
+    pha
+    jsr turn_emulation_off
+    pla
+    ldx romsel_copy:sta rom_workspace_table,x
+    cmp #rom_workspace_byte_want_none:beq dont_print
+    \ Print a message (it's not an error) to tell the user to press (CTRL-)BREAK
+    \ to trigger the workspace allocation. On a Master CTRL-BREAK is needed, on
+    \ a B/B+ BREAK suffices.
+    jsr print_inline:equs "Press", top_bit or ' '
+    jsr call_osbyte_identify_host
+    cpx #3:bcc no_ctrl_needed
+    jsr print_inline:equs "CTRL", top_bit or '-'
+.no_ctrl_needed
+    jsr print_inline:equs "BREAK", top_bit or cr
+.dont_print
+    jmp unstack_axy_service_call_handled
+.not_special
+    \ So there was at least one argument. Check there isn't a second argument.
+    txa:pha
+    ldy parser_command_y:clc:jsr gsinit:beq only_one_argument
+.bad_command
+    jmp error_bad_command
+}
+
+
+\ Handle *STEM STATUS; show the emulation status.
+\
+\ TODO: We could show much more here, but it's relatively verbose code and I'm
+\ not sure there's all that much value in it. Possibly it would be worth dumping
+\ out a few select flags bytes as hex for debugging/support purposes, even if
+\ it's not all that user friendly.
+.stem_status
+{
+    jsr print_workspace_status
+    jsr ne_iff_workspace:beq done
+
+    jsr print_inline:equs "Emulation:", top_bit or ' '
+    jsr eq_iff_vectors_claimed:bne vectors_not_claimed
+
+    xassert_oswrch_ww_valid
+
+    ldy #emulation_disabled_offset:lda (oswrch_ww),y
+    beq enabled
+    pha
+    jsr print_inline:equs "disabled ", top_bit or '('
+    pla
+    ldx #lo(emulation_disabled_explain_table):ldy #hi(emulation_disabled_explain_table)
+    jsr explain
+    lda #')':jsr oswrch
+.osnewl_and_done
+    jsr osnewl
+    jmp done
+.enabled
+    jsr print_inline:equs "enabled ", top_bit or '('
+
+    ldy #vt102_flags_offset:lda (oswrch_ww),y
+    and #vt102_flag_ansi_mode:bne ansi_mode
+    jsr print_inline:equs "VT52)", top_bit or cr
+    jmp done
+.ansi_mode
+    jsr print_inline:equs "VT102/ANSI)", top_bit or cr
+.done
+    jmp unstack_axy_service_call_handled
+
+.vectors_not_claimed
+    jsr print_inline:equs "of", top_bit or 'f'
+    jmp osnewl_and_done
+
+
+\ Use the table at YX to output a decoded version of the byte at A. The table
+\ has the form:
+\
+\ equb bit_mask:equs "corresponding strin", top_bit or 'g'
+\ ...
+\ equb 0
+\
+\ If (A AND bit_mask) is non-0, the string will be output. Multiple strings may
+\ be output if multiple table entries match; a space will be used to separate
+\ them.
+\
+\ On exit oswrch_ww is preserved if it was initialised on entrance, otherwise
+\ oswrch_w should be considered corrupted.
+\
+\ Corrupts: all other zero page workspace
+.explain
+{
+    explain_table_ptr = transient_zp
+
+    stx explain_table_ptr:sty explain_table_ptr+1
+    pha \ save original A
+    ldx #0 \ separator to output before a match (NUL before the first match)
+    ldy #0
+.table_loop
+    pla:pha \ peek original A
+    and (explain_table_ptr),y:bne match
+.skip_loop
+    iny:lda (explain_table_ptr),y:bpl skip_loop
+    xbmi_always at_string_terminator
+.match
+    txa:jsr osasci:ldx #' ' \ output the separator and change it to ' '
+.match_loop
+    iny:lda (explain_table_ptr),y:pha
+    xand_not top_bit:jsr osasci
+    pla:bpl match_loop
+.at_string_terminator
+    \ (explain_table_ptr),Y is the top-bit-set byte terminating a string in the table.
+    iny:lda (explain_table_ptr),y:bne table_loop
+    pla \ discard saved A
+    debug_corrupt_oswrch_zp
+    jmp init_oswrch_ww_vectors_claimed
+}
+
+\ The text in this table is short partly to save space in the ROM and partly to
+\ ensure it fits on a 40 character line if multiple bits are set.
+.emulation_disabled_explain_table
+    equb emulation_disabled_unsupported_mode:equs "mod", top_bit or 'e'
+    equb emulation_disabled_text_at_graphics:equs "vdu", top_bit or '5'
+    \ The next one is a bit pointless, but maybe someone is redirecting output
+    \ to a file or maybe we have a bug and think the screen is disabled when it
+    \ isn't, so let's support it.
+    equb emulation_disabled_screen_disabled:equs "vdu2", top_bit or '1'
+    equb emulation_disabled_text_window_set:equs "vdu2", top_bit or '8'
+    equb 0
+}
+
+
+\ Call osbyte with osbyte_identify_host; factored out to save a few bytes as
+\ it's used in a couple of places.
+.*call_osbyte_identify_host
+    lda #osbyte_identify_host:ldx #1:jmp osbyte
+
+
+{
+\ Table of arguments supported by *VT102/*VT52; used with parse_next_argument.
+\
+\ The ordering is important here, as if an abbreviation could match multiple
+\ arguments, it will match the first one in the list. There's an element of
+\ arbitrary choice on my part here, of course:
+\
+\ - GAPLESS comes before GAPPY since GAPPY is the default and therefore is a low
+\   priority for abbreviation.
+\
+\ - STRICT comes before STORED and NODEL comes before NOSTORED; since most of
+\   the time you probably just want to let the workspace size implicitly control
+\   the stored screen size, the stored screen options seem less important.
+\
+\ - OFF comes before ON because ON is the default/is strictly pointless and only
+\   provided for symmetry.
+\
+\ TODO: Currently every time you issue a *VT102/VT52 command, the user options
+\ are taken completely from that command - you can't "tweak" the current
+\ options. I am not sure this is a big restriction, but it would be possible to
+\ add (say) a "CURRENT" argument which copies user_options into the low byte of
+\ command_options. You could then do things like "*VT102 CURRENT DEL" to say "I
+\ want the current settings, but with the DEL option (instead of NODEL)".
+\ Alternatively it would be possible for the default to be "start with
+\ current user_options" and have a "DEFAULT" option which says "set the low byte
+\ of command_options to 0".
+
+\ The 16-bit handler argument for each table entry is used as follows:
+\
+\ - the top bit (b15) of all the arguments in the table must be set as that's a
+\   requirement imposed by parse_next_argument.
+\ 
+\ - b14 clear indicates that the command options we're building up at
+\   command_options should have bits set (b13 set) or cleared (b13 clear) if this
+\   argument is encountered; the bits to set or clear are those set in b0-b12.
+\
+\ - b14 set indicates "other" (than set/clear) and gets handled separately.
+other_option = (1 << 15) or (1 << 14)
+clear_option = (1 << 15)
+set_option   = (1 << 15) or (1 << 13)
+
+\ Most arguments toggle bits in the low byte of command_options, which is used
+\ directly to set user_options; the upper byte contains bits which are only used
+\ during the parsing.
+\ bits 13-15 are meaningless
+command_options_ansi_mode = (1 << 12) 
+command_options_off       = (1 << 11)
+\ bits 8-10 are unused at the moment
+
+.vt52_vt102_table
+    equs "STRICT":xequw_be set_option or user_option_dec_us or user_option_ignore_del or user_option_ignore_unsupported
+    equs "32":xequw_be other_option or user_option_32_lines
+    equs "25":xequw_be other_option or user_option_25_lines
+    equs "24":xequw_be other_option or user_option_24_lines
+    equs "DECUS":xequw_be set_option or user_option_dec_us
+    equs "ACORNUS":xequw_be clear_option or user_option_dec_us
+    equs "NODEL":xequw_be set_option or user_option_ignore_del
+    equs "DEL":xequw_be clear_option or user_option_ignore_del
+    equs "PURE":xequw_be set_option or user_option_ignore_unsupported
+    equs "HYBRID":xequw_be clear_option or user_option_ignore_unsupported
+    equs "GAPLESS":xequw_be set_option or user_option_mode_3_gapless
+    equs "GAPPY":xequw_be clear_option or user_option_mode_3_gapless
+    equs "NOSTORED":xequw_be clear_option or user_option_stored_screen
+    equs "STORED":xequw_be set_option or user_option_stored_screen
+    equs "OFF":xequw_be set_option or command_options_off
+    equs "ON":xequw_be clear_option or command_options_off
+    equb 0
+
+command_options = transient_zp \ 2 bytes
+
+\ *VT52 command handler
+.^command_vt52
+    lda #0:sta command_options
+    xbeq_always command_vt52_vt102_common
+
+\ *VT102 command handler
+.^command_vt102
+    lda #lo(command_options_ansi_mode):sta command_options
+    lda #hi(command_options_ansi_mode)
+    fall_through_to command_vt52_vt102_common
+
+\ Common code for *VT52/*VT102; entered with command_options initialised
+\ appropriately.
+.command_vt52_vt102_common
+    sta command_options+1
+    sty parser_command_y
+    \ If we have a large workspace, we default to having a stored screen. If we
+    \ have no workspace we don't complain yet; this allows *VT102 OFF to be used
+    \ as a no-op without generating an error.
+    jsr ne_iff_workspace:beq small_workspace
+    jsr init_oswrch_ww_corrupt_axy
+    \ If we have a large workspace, we default to having a stored screen.
+    eq_iff_large_workspace:bne small_workspace
+    lda command_options:ora #user_option_stored_screen:sta command_options
+.small_workspace
+.check_next_vt52_vt102_argument
+    ldx #lo(vt52_vt102_table)
+    ldy #hi(vt52_vt102_table)
+    lda #0
+    jsr parse_next_argument
+    tya:beq special
+
+    \ Bit 6 of the high byte (Y) of the handler argument is clear if this is a
+    \ straightforward set-or-clear-bits operation.
+    asl a:bpl set_or_clear_bits
+
+    \ It's an other_option handler argument. We just interpret the handler
+    \ argument manually now; currently it can only be a line number
+    \ specification (user_option_*_lines).
+    lda command_options
+    xand_not user_options_lines_mask
+    ora identity_table,x
+    sta command_options
+    jmp check_next_vt52_vt102_argument
+
+.set_or_clear_bits
+    \ Bit 5 of the high byte is set if we should set, or clear if we shoud
+    \ clear.
+    asl a:bmi set_bits
+    \ Clear bits in command_options which are set in YX
+    txa:eor #255:and command_options:sta command_options
+    tya:eor #255:and command_options+1
+.set_or_clear_bits_common
+    sta command_options+1
+    jmp check_next_vt52_vt102_argument
+.set_bits
+    \ Set bits in command_options which are set in YX
+    txa:ora command_options:sta command_options
+    tya:ora command_options+1
+    xbmi_always set_or_clear_bits_common \ Y always has top bit set
+
+.no_workspace
+    jsr generate_error
+    equs error_number, "No workspace; do *"
+    name
+    equb 0
+
+.special 
+    \ parse_next_argument returned with Y=0, i.e. this is one of the special
+    \ arguments not a handler argument.
+    txa:bne error_bad_command \ we've encountered an invalid argument
+    \ All arguments have been parsed
+
+    \ If the user requested OFF, deal with that. We're not
+    \ too strict with the parsing; if the user says OFF, it trumps any other
+    \ argument, but we don't generate an error if there were other arguments.
+    assert lo(command_options_off) == 0
+    lda command_options+1:and #hi(command_options_off):beq not_off
+    jsr turn_emulation_off
+    jmp unstack_axy_service_call_handled
+.not_off
+
+    \ Now we know we're not handling OFF, it's an error if there's no workspace.
+    jsr ne_iff_workspace:beq no_workspace
+
+    jsr init_oswrch_ww_corrupt_axy
+
+    \ If we only have a small workspace and a stored screen has been requested,
+    \ that's an error.
+    eq_iff_large_workspace:beq large_workspace
+    lda command_options:bpl no_stored_screen
+    jsr generate_error:equs error_number, "Not enough workspace for stored screen", 0
+.no_stored_screen
+.large_workspace
+
+    \ Turn the emulation on (a no-op if it's already enabled) and set the
+    \ emulation settings requested by command_options.
+    jsr turn_emulation_on
+    assert lo(command_options_ansi_mode) == 0
+    lda command_options+1:and #hi(command_options_ansi_mode):tax
+    lda command_options
+    jsr update_emulation_settings
+
+    jmp unstack_axy_service_call_handled
+}
+
+
+\ TODO: If we get low on space, this could be conditionally included only in
+\ test builds (which would be an orthogonal concept to debug builds); it's very
+\ useful for testing, but probably has little value otherwise. (But then again,
+\ it's not all the big in the first place.)
+.command_redraw
+{
+    sec:jsr gsinit:beq no_arguments
+.*error_bad_command
+    jsr generate_error:equs error_number_bad_command, "Bad command", 0
+.no_arguments
+    jsr eq_iff_vectors_claimed:bne cant_redraw
+    jsr init_oswrch_ww_vectors_claimed
+    \ If we're disabled because of an unsupported mode we can't redraw, but we
+    \ do support redraw if we're just temporarily disabled.
+    ldy #emulation_disabled_offset:lda (oswrch_ww),y
+    assert emulation_disabled_unsupported_mode == 1<<0
+    lsr a:bcs cant_redraw
+    ldy #user_options_offset:lda (oswrch_ww),y
+    assert user_option_stored_screen == 1<<7
+    bpl cant_redraw
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:pha
+    ldy #emulated_screen_lines_offset:lda (oswrch_ww),y
+    sec:sbc #1:ldy #vt102_cursor_y_offset:sta (oswrch_ww),y
+.loop
+    jsr redraw_line
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y
+    sec:sbc #1:sta (oswrch_ww),y
+    bpl loop
+    pla:ldy #vt102_cursor_y_offset:sta (oswrch_ww),y
+.^unstack_axy_service_call_handled
+    pla:tay
+    pla:tax
+    pla:lda #0
+    rts
+.cant_redraw
+    \ A slightly generic error but no point burning space on distinct errors for
+    \ no real benefit.
+    jsr generate_error:equs error_number, "Can't redraw", 0
+}
+
+
+\ Invoke as:
+\     jsr print_inline:equs "string to prin", top_bit or 't':<control resumes here>
+\
+\ Writes the string out using OSASCI (the top bit is stripped from the
+\ terminating character before it's output).
+\
+\ Follows JGH's suggestion to use &f6/&f7 as zero page workspace since they are
+\ only used by OSRDRM and ROMFS. (http://beebwiki.mdfs.net/6502_routines)
+\
+\ Preserves: X, W (if used as oswrch_ww)
+.*print_inline
+{
+    pla:sta &f6
+    pla:sta &f7
+    \ &f6 points to one byte before the start of the string to print
+    lda oswrch_ww+1:pha
+    ldy #0
+.loop
+    iny
+    lda (&f6),y:xand_not top_bit:jsr osasci
+    lda (&f6),y:bpl loop
+
+    \ Restore oswrch_ww+1; we know its low byte was zero, and if it wasn't
+    \ initialised this is harmless as OSASCI could have corrupted it anyway.
+    pla:sta oswrch_ww+1
+
+    \ Y contains number of bytes following JSR (including terminator).
+    clc:tya:adc &f6:tay
+    lda #0:sta oswrch_ww:adc &f7:pha
+    tya:pha
+    rts
+}
+
+
+\ Invoke as:
+\     jsr generate_error:equs error_number, "Error message", 0
+\
+\ The error number must not be zero; errors < 128 are language errors anyway.
+\ Control will never return.
+\
+\ This doesn't use a top-bit-set character to terminate the error message; it
+\ saves one byte per error message generated, but we generate relatively few
+\ error messages and the saving doesn't compensate for the bloat in the size of
+\ this routine. (Note that a) the error number is very likely to have the top
+\ bit set, so it has to be special-cased b) we need to write a 0 terminator
+\ after the error on the stack.)
+\
+\ Follows JGH's suggestion to use &fd/&fe as zero page workspace since they are
+\ the OS error pointer anyway. (http://beebwiki.mdfs.net/6502_routines)
+.*generate_error
+{
+    pla:sta &fd
+    pla:sta &fe
+    \ &fe points to one byte before error number
+    lda #brk_opcode:sta stack
+    ldy #0
+.loop
+    iny:lda (&fd),y:sta stack,y
+    bne loop
+    jmp stack
+}
+
+} \ close file scope

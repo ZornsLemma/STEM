@@ -1,0 +1,363 @@
+\ line-attributes.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Implementations of escape sequences which change line attributes and
+\ assocaited utility routines.
+
+{ \ open file scope
+
+.unstack_rts
+    pla
+    rts
+
+\ We've seen <ESC>...4; this could be <ESC>#4 (DECDHL)
+.*double_height_line_bottom
+{
+    lda #(line_attribute_double_width or line_attribute_double_height_bottom)
+    xbne_always line_attribute_change_common
+}
+
+\ We've seen <ESC>...5; this could be <ESC>#5 (DECSWL)
+.*single_width_line
+{
+    lda #0
+    xbeq_always line_attribute_change_common
+}
+
+\ We've seen <ESC>...6; this could be <ESC>#6 (DECDWL)
+.*double_width_line
+{
+    lda #line_attribute_double_width
+    xbne_always line_attribute_change_common
+}
+
+\ We've seen <ESC>...3; this could be <ESC>#3 (DECDHL)
+.*double_height_line_top
+{
+    lda #(line_attribute_double_width or line_attribute_double_height_top)
+    fall_through_to line_attribute_change_common
+}
+
+.line_attribute_change_common
+{
+    xassert_oswrch_ww_valid
+    pha \ stack new line attributes for later use
+    tax
+
+    jsr get_first_pending_escape_character
+    cmp #'#':bne unstack_rts
+    \ We've seen <ESC>#x
+
+    ldy #fast_path_flags_offset
+    lda #fast_path_some_line_attributes
+    jsr update_flags_at_y_using_a_x
+
+    ldy #user_options_offset:lda (oswrch_ww),y
+    assert user_option_stored_screen == 1<<7
+    bpl no_stored_screen
+
+    \ If this is a change to a double-width line, we need to erase the right
+    \ half of the line on the stored screen.
+    pla:pha \ peek new line attributes from stack
+    beq not_double_width
+    lda #40
+    ldx #0 \ character attributes
+.loop
+    pha
+    tay \ X co-ordinate for store
+    lda #' '
+    jsr set_stored_character
+    pla
+    clc:adc #1
+    cmp #80:bne loop
+.not_double_width
+
+    pla:jsr set_current_line_attributes \ set new line attributes
+    fall_through_to redraw_line
+}
+
+
+\ Redraw the current line in video RAM using the stored screen. The caller is
+\ responsible for only calling this if the stored screen is enabled. The logical
+\ and hardware cursor positions are left unchanged.
+\
+\ Corrupts: all registers and all zero page except W
+.*redraw_line
+{
+    xassert_oswrch_ww_valid
+    xassert_stored_screen_enabled
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:pha
+    lda #0:sta (oswrch_ww),y
+    jsr get_current_line_len:pha
+    lda #0:pha
+
+.loop
+    \ stack (top): logical_x chararacters_left
+    tsx:ldy stack+1,x \ Y=logical_x
+    jsr get_stored_character \ A=character, X=character attributes
+    \ The line attributes don't change within the line, of course, but we have
+    \ no spare memory or registers we can conveniently store them in, so we
+    \ retrieve them every time.
+    pha:jsr get_current_line_attributes:tay:pla \ preserves X
+    jsr print_character
+    
+    tsx
+    inc stack+1,x \ logical_x+=1
+    dec stack+2,x \ characters_left-=1
+    bne loop
+
+    pla:pla \ discard working values on stack
+
+    xassert_oswrch_ww_valid
+    pla:ldy #vt102_logical_cursor_x_offset:sta (oswrch_ww),y
+    rts
+}
+
+.width_unchanged_indirect
+    jmp width_unchanged
+
+.single_to_double_width_indirect
+    jmp single_to_double_width
+
+.finished_video_ram_update_indirect
+    jmp finished_video_ram_update
+
+\ There's no stored screen, so make a best-effort attempt to perform the
+\ line attribute change on the existing contents of the video RAM.
+.no_stored_screen
+{
+    old_line_attributes = oswrch_vh
+
+    jsr page_in_video_ram
+
+    \ If the line is already double height, we don't attempt to patch up the
+    \ video RAM; this is tricky because the current line's video RAM only
+    \ contains half of the character. There are some cases which could be
+    \ made to work by looking at data in adjacent lines, but it's extremely
+    \ fiddly and probably of little practical use.
+    jsr get_current_line_attributes:sta old_line_attributes
+    and #(line_attribute_double_height_top or line_attribute_double_height_bottom)
+    bne finished_video_ram_update_indirect
+
+    pla:pha \ peek new line attributes from stack
+    eor old_line_attributes
+    and #line_attribute_double_width
+    beq width_unchanged_indirect
+    \ The line attributes have changed width.
+    lda old_line_attributes:and #line_attribute_double_width
+    beq single_to_double_width_indirect
+    fall_through_to double_to_single_width
+}
+
+
+\ The line attributes have changed from double width to single width, so
+\ take every other pixel across the line to generate the new left half of
+\ the screen and then erase the right half.
+.double_to_single_width
+{
+    from_lhs = oswrch_t
+    from_rhs = oswrch_v
+    to = oswrch_u
+    count = oswrch_wl
+    work = oswrch_wh
+
+    assert from_lhs == oswrch_t:jsr get_video_ram_current_line_start_address_in_t_wrapped
+    lda from_lhs:sta from_rhs:sta to
+    lda from_lhs+1:sta from_rhs+1:sta to+1
+    lda #8:ldx #from_rhs:jsr increment_screen_pointer_with_wrapping
+
+    \ Squash the whole line into the left half of the line.
+    lda #39:sta count
+.character_loop
+    \ Derive a single-width character at to from the two halves of the
+    \ double-width character at from_lhs and from_rhs.
+    ldy #7
+.character_row_loop
+    \ We are going to build up the single-width byte for row Y at 'work'; we
+    \ don't need to initialise it as we will rotate eight bits into it so the
+    \ previous value is irrelevant.
+    ldx #8
+    lda (from_lhs),y
+.half_character_loop
+    asl a:asl a:rol work
+    dex
+    beq done_both_halves
+    cpx #4:bne half_character_loop
+    lda (from_rhs),y
+    jmp half_character_loop
+.done_both_halves
+    lda work
+    sta (to),y
+    dey
+    bpl character_row_loop
+    ldx #from_lhs:lda #16:jsr increment_screen_pointer_with_wrapping
+    ldx #from_rhs:lda #16:jsr increment_screen_pointer_with_wrapping
+    ldx #to:lda #8:jsr increment_screen_pointer_with_wrapping
+    dec count:bpl character_loop
+    jsr init_oswrch_ww_vectors_claimed
+
+    \ Erase the right half of the line; remember that it's currently
+    \ double-width so we must erase from character 20 to do the right half.
+    lda #0  \ character attributes
+    ldx #20 \ from
+    ldy #40 \ to
+    jsr erase_characters_within_line
+
+    jmp finished_video_ram_update
+}
+
+
+\ The line attributes have changed from single width to double width, so expand
+\ the left half of the line to fill the full screen width.
+.single_to_double_width
+{
+    from = oswrch_u
+    to = oswrch_t
+    count = oswrch_vl
+
+    ldy #79:ldx #to:jsr get_video_ram_character_address_current_line_wrapped
+    ldy #39:sty count:ldx #from:jsr get_video_ram_character_address_current_line_wrapped
+
+.character_loop
+    clv
+.half_character_loop
+    ldy #7
+.character_row_loop
+    lda (from),y
+    bvs left_half
+    and #%1111
+    xbpl_always common
+.left_half
+    lsr a:lsr a:lsr a:lsr a
+.common
+    tax:lda double_width_table,x
+    sta (to),y
+    dey:bpl character_row_loop
+    php \ save V (SBC will corrupt it)
+    ldx #to:jsr decrement_screen_pointer_with_wrapping
+    plp \ restore V
+    bvs done_character
+    set_v_clear_n_corrupt_z
+    xbvs_always half_character_loop
+.done_character
+    ldx #from:jsr decrement_screen_pointer_with_wrapping
+    dec count:bpl character_loop
+
+    fall_through_to width_unchanged
+}
+
+
+\ If the old line attributes were single height and the new line attributes
+\ are double height, double up the relevant half of the current line. Bear
+\ in mind that if the old line attributes weren't single height we already
+\ bailed out earlier on, so we only need to check the new line attributes.
+.width_unchanged
+{
+    pla:pha \ peek new line attributes from the stack
+    and #(line_attribute_double_height_top or line_attribute_double_height_bottom)
+    beq finished_video_ram_update
+
+    ptr = oswrch_t
+    last_row_plus_1 = oswrch_ul
+    count = oswrch_uh
+
+    assert line_attribute_double_height_top == 4
+    assert line_attribute_double_height_bottom == 8
+    sta last_row_plus_1
+
+    assert ptr == oswrch_t:jsr get_video_ram_current_line_start_address_in_t_wrapped
+
+    lda #79:sta count
+.character_loop
+    ldy last_row_plus_1
+    ldx #4
+.store_half_loop
+    dey
+    lda (ptr),y
+    pha
+    dex:bne store_half_loop
+    ldy #0
+    ldx #4
+.expand_half_loop
+    pla
+    sta (ptr),y
+    iny:sta (ptr),y
+    iny
+    dex:bne expand_half_loop
+    ldx #ptr:lda #8:jsr increment_screen_pointer_with_wrapping
+    dec count:bpl character_loop
+
+    fall_through_to finished_video_ram_update
+}
+
+
+.finished_video_ram_update
+    jsr page_in_main_ram
+
+    \ Now we've finished with the video RAM, record the line attribute change
+    \ and update the cursor just as we would in the stored screen case.
+    pla:fall_through_to set_current_line_attributes
+
+
+\ Set the current line attributes to be A and update the logical and hardware
+\ cursor positions accordingly.
+.set_current_line_attributes
+    xassert_oswrch_ww_valid
+    pha
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:tay
+    pla:sta (oswrch_ww),y
+    jmp set_both_cursors_to_current_logical_x_y
+
+
+\ Get the current line attributes in A; the flags on exit reflect the value in
+\ A.
+\
+\ Preserves: X
+.*get_current_line_attributes
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:tay
+    lda (oswrch_ww),y
+    if debug
+        php
+        ldy #42
+        plp
+    endif
+    rts
+
+
+\ Advance a pointer into video RAM at zp,X by A bytes, wrapping around if the
+\ advance causes it to go past the end of video RAM.
+\
+\ Preserves: X, Y
+.increment_screen_pointer_with_wrapping
+{
+    clc:adc &00,x:sta &00,x
+    lda #0:adc &01,x
+    bpl no_wrap
+    sec:sbc screen_size_high_byte
+.no_wrap
+    sta &01,x
+    rts
+}
+
+
+\ Decrement a pointer into video RAM at zp,X by 8 bytes, wrapping around if the
+\ decrement causes it to go past the start of video RAM.
+\
+\ Preserves: X, Y
+.decrement_screen_pointer_with_wrapping
+{
+    lda &00,x:sec:sbc #8:sta &00,x
+    lda &01,x:sbc #0
+    cmp screen_memory_start_high_byte:bcs no_wrap
+    xclc:adc screen_size_high_byte
+.no_wrap
+    sta &01,x
+    rts
+}
+
+} \ close file scope

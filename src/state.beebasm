@@ -1,0 +1,768 @@
+\ state.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Implementation of escape sequences which modify the terminal state and
+\ associated utility routines.
+
+{ \ open file scope
+
+\ A note on character sets and terminology:
+\
+\ The VT102 manual seems to slightly overload the term "character set" to mean
+\ two different things:
+\ 1. Collections of symbols, e.g. the UK character set, the special character
+\    and line drawing character set.
+\ 2. Fixed names (G0/G1/G2/G3) which can be configured to refer to a character
+\    set in sense 1.
+\
+\ In an attempt to keep things straight in the code, I have used a different
+\ name for each of these:
+\ 1. A collection of symbols is called a character set
+\ 2. G0/G1/G2/G3 are referred to as "character set pointers", because they can
+\    be changed to point to a different character set
+\
+\ TODO: Looking at the VT510 manual for SCS, it seems to use the term "G-set"
+\ for what I've called a "character set pointer"; perhaps change to use that
+\ terminology (which is only an internal name in the source code and isn't
+\ user-visible).
+
+
+{
+\ We've seen <ESC>F (VT52 enter graphics mode)
+\ xterm doesn't seem to support this, but my reading of the VT102 manual suggests
+\ this is correct - the VT102 doesn't support the actual VT52 graphics characters.
+\ TODO: It might be a nice extension to allow the actual VT52 graphics
+\ characters to be used; see the TODO comment inside encode_character for some
+\ thoughts on this.
+.*vt52_enter_graphics_mode
+    lda #character_set_pointer_vt52_graphics
+    assert character_set_pointer_vt52_graphics != 0
+    xbne_always common
+
+.*vt102_shift_out
+    lda #character_set_pointer_g1
+    assert character_set_pointer_g1 != 0
+    xbne_always common
+
+\ We've seen <ESC>G (VT52 exit graphics mode)
+\ This behaviour derived from experimenting with the 'vt102' emulator; see test
+\ v52cs-2. TODO: Appendix C of the VT102 manual
+\ (http://vt100.net/docs/vt102-ug/appendixc.html) says this is either US or UK
+\ as determined by SET-UP, so it might be nice to allow this to be specified by
+\ the user.
+.*vt52_exit_graphics_mode
+    jsr set_g0_g1_to_us
+    fall_through_to vt102_shift_in
+
+.*vt102_shift_in
+    lda #character_set_pointer_g0
+.common
+    xassert_oswrch_ww_valid
+    ldy #current_character_set_pointer_offset
+    sta (oswrch_ww),y
+    jmp update_fast_path_flags
+}
+
+
+{
+\ We've seen <ESC>N (SS2)
+.*single_shift_2
+    ldx #character_set_pointer_g2
+    assert character_set_pointer_g2 != 0
+    xbne_always common
+
+\ We've seen <ESC>O (SS3)
+.*single_shift_3
+    ldx #character_set_pointer_g3
+.common
+    xassert_oswrch_ww_valid
+    ldy #current_character_set_pointer_offset:lda (oswrch_ww),y
+    assert current_character_set_pointer_offset + 1 == pending_character_set_pointer_offset
+    iny:sta (oswrch_ww),y
+    txa:dey:sta (oswrch_ww),y
+    ldx #1:ldy #fast_path_flags_offset
+    lda #fast_path_temporary_character_set_pointer
+    jmp update_flags_at_y_using_a_x
+}
+
+
+{
+\ Enter VT52 mode
+.*set_vt52_mode_subroutine
+    ldx #0:xbeq_always common
+
+\ We've seen <ESC>< (DECANM)
+.*vt52_ansi_mode
+    fall_through_to set_ansi_mode_subroutine
+
+\ Enter ANSI mode
+.*set_ansi_mode_subroutine
+    ldx #1
+
+.common
+    \ We call the flag 'ansi' because *reset* (i.e. clear) enables VT52 mode.
+    lda #vt102_flag_ansi_mode:jsr update_vt102_flags_using_a_x
+    jmp set_key_maps_from_modes
+}
+
+
+{
+.select_graphic_rendition_jump_table
+    equb 0:equh character_attribute_off
+    equb 1:equh bold_on
+    equb 4:equh underline_on
+    equb 7:equh reverse_video_on
+    equb top_bit
+
+\ We've seen <ESC>[...0...m (SGR; turn off character attributes)
+.character_attribute_off
+    ldy #current_character_attributes_offset:lda #0:sta (oswrch_ww),y 
+    jmp update_fast_path_flags
+
+\ We've seen <ESC>[...7...m (SGR; reverse video)
+.reverse_video_on
+    lda #character_attribute_reverse
+.common_end
+    ldy #current_character_attributes_offset
+    ora (oswrch_ww),y
+    sta (oswrch_ww),y
+    jmp update_fast_path_flags
+
+\ We've seen <ESC>[...4...m (SGR; underline)
+.underline_on
+    lda #character_attribute_underline
+    xbne_always common_end
+
+\ We've seen <ESC>[...1...m (SGR; bold)
+.bold_on
+    lda #character_attribute_bold
+    xbne_always common_end
+
+\ We've seen <ESC>[...m (SGR)
+.*select_graphic_rendition
+    xassert_oswrch_ww_valid
+    ldy #parameter_count_plus_one_offset:lda (oswrch_ww),y
+    cmp #2:bcs have_parameters
+    \ No parameters is equivalent to a 0 parameter here; first_parameter will
+    \ already have been set to 0 by vt102_escape so we just need to increment
+    \ the parameter count to keep handle_parameters_via_jump_table happy.
+    lda #2:sta (oswrch_ww),y
+.have_parameters
+    lda #lo(select_graphic_rendition_jump_table):sta oswrch_tl
+    lda #hi(select_graphic_rendition_jump_table):sta oswrch_th
+    xbne_always handle_parameters_via_jump_table \ jump table is in ROM so high byte >=&80
+}
+
+
+{
+\ We've seen <ESC>[...h (set mode)
+.*set_mode
+    ldx #1:xbne_always set_reset_mode
+\ We've seen <ESC>[...l (reset mode)
+.*reset_mode
+    ldx #0
+.set_reset_mode
+    xassert_oswrch_ww_valid
+
+    \ Set up T to point to the relevant jump table depending whether we have
+    \ a private parameter indicator or not.
+    ldy #private_parameter_offset:lda (oswrch_ww),y:beq not_private_parameter
+    lda #2
+.not_private_parameter
+    tay
+    lda set_reset_jump_tables,y:sta oswrch_tl
+    lda set_reset_jump_tables+1,y:sta oswrch_th
+    fall_through_to handle_parameters_via_jump_table
+
+\ Loop through the parameters (of which there may be none), passing each to
+\ the relevant handler in the jump table at T.
+.^handle_parameters_via_jump_table
+    lda #1
+.loop
+    \ A contains 1-based index of parameter to process
+    ldy #parameter_count_plus_one_offset
+    cmp (oswrch_ww),y:bcs update_flags_at_y_using_a_x_rts
+    tay:iny:tya:pha \ increment it, Y=incremented value and push Y to stack
+        xclc \ bcs not taken
+        adc #pending_escape_offset+first_parameter_offset-2:tay \ Y=workspace offset of parameter
+        lda oswrch_tl:pha:lda oswrch_th:pha \ save T so handler can corrupt it
+        txa:pha \ save X so handler can corrupt it
+            \ jump_a_via_t preserves X so the handler can see it
+            lda (oswrch_ww),y:jsr jump_a_via_t \ invoke appropriate handler for parameter
+            \ At this point we have to assume almost everything is corrupt; some of the
+            \ handlers are fairly involved code - we do expect oswrch_ww to be preserved,
+            \ as usual.
+            xassert_oswrch_ww_valid
+        pla:tax \ restore X
+        pla:sta oswrch_th:pla:sta oswrch_tl \ restore T
+    pla \ A is 1-based index of next parameter to process
+    xbne_always loop
+
+
+\ Set (if X is non-0) or clear (if X is 0) the bits of vt102_flags which are set
+\ in A.
+\
+\ Preserves: X
+.*update_vt102_flags_using_a_x
+{
+    ldy #vt102_flags_offset
+    fall_through_to update_flags_at_y_using_a_x
+
+\ Set (if X is non-0) or clear (if X is 0) the bits of workspace at Y which are
+\ set in A.
+\
+\ Preserves: X
+.*update_flags_at_y_using_a_x
+    xassert_oswrch_ww_valid
+    cpx #0:beq clear_flag
+    ora (oswrch_ww),y
+    sta (oswrch_ww),y
+.^update_flags_at_y_using_a_x_rts
+    rts
+.clear_flag
+    eor #255
+    and (oswrch_ww),y
+    sta (oswrch_ww),y
+    rts
+}
+
+
+.set_reset_jump_tables
+    equw non_private_parameter_set_reset_jump_table
+    equw private_parameter_set_reset_jump_table
+
+.non_private_parameter_set_reset_jump_table
+    equb 4:equh set_reset_insert_mode
+    equb 20:equh set_reset_linefeed_new_line_mode
+    \ TODO: We don't support Keyboard Action Mode (KAM); this wouldn't be hard to do,
+    \ but it seems a bit lethal and I'm not sure there's any real use for it. If
+    \ we do support it, we should probably provide a means to forcibly re-enable
+    \ the keyboard, e.g. a function key
+    \ TODO: We don't support Send-Receive Mode (SRM); this is probably
+    \ *possible* but could be very tricky and it's not clear to me it has much
+    \ use. (We'd effectively need to enter our OSWRCH code directly from within
+    \ the INSV handler. It would have to scrupulously avoid any OS calls as they
+    \ might not be re-entrant. If our OSWRCH code was currently running we'd
+    \ have to push the character INSV is trying to print on to some sort of
+    \ queue and our OSWRCH code would have to check that queue every time it
+    \ finished, as our OSWRCH code itself isn't re-entrant either and making it
+    \ so would be tricky. I've possibly overlooked some other problems too.)
+    equb top_bit
+
+.private_parameter_set_reset_jump_table
+    equb 1:equh set_reset_cursor_key_mode
+    equb 2:equh set_vt52_mode_subroutine \ 'set' case can't occur (DECANM)
+    equb 3:equh set_reset_column_mode
+    equb 5:equh set_reset_screen_mode
+    equb 6:equh set_reset_origin_mode
+    equb 7:equh set_reset_auto_wrap_mode
+    equb 8:equh set_reset_auto_repeat_mode
+    equb 25:equh set_reset_text_cursor_enable_mode
+    equb top_bit
+}
+
+
+\ set/reset text cursor enable mode (DECTCEM) - this isn't supported by a real
+\ VT102, I believe it first appeared on the VT220; we support it as a handy
+\ extension.
+.set_reset_text_cursor_enable_mode
+{
+    \ We don't track the state of the text cursor anywhere, as it's never
+    \ needed.
+    ldy #crtc_register_cursor_start:sty crtc_register
+    ldy #crtc_cursor_start_disable_cursor
+    txa:beq cursor_off
+    ldy vdu_cursor_start
+.cursor_off
+    sty crtc_data
+.^set_reset_text_cursor_enable_mode_rts
+    rts
+}
+
+\ set/reset auto wrap mode (DECAWM)
+.set_reset_auto_wrap_mode
+{
+    lda #vt102_flag_auto_wrap_mode:jsr update_vt102_flags_using_a_x
+    \ If we've just reset auto wrap mode, we must force
+    \ fast_path_auto_wrap_pending off since that reflects (auto-wrap on
+    \ *and* auto-wrap pending) and auto-wrap is now off. If we've just set
+    \ auto wrap mode, we don't do anything - it is possible it was already
+    \ on and an auto-wrap was pending, and we aren't clearing the pending
+    \ auto-wrap.
+    txa:bne set_reset_text_cursor_enable_mode_rts
+    ldy #fast_path_flags_offset
+    lda #fast_path_auto_wrap_pending
+    jmp update_flags_at_y_using_a_x
+}
+
+
+\ set/reset linefeed/new line mode (LNM)
+.set_reset_linefeed_new_line_mode
+    lda #vt102_flag_linefeed_new_line_mode
+    xbne_always update_vt102_flags_using_a_x
+
+
+\ set/reset insert mode (IRM)
+.set_reset_insert_mode
+    ldy #fast_path_flags_offset
+    lda #fast_path_insert_mode
+    xbne_always update_flags_at_y_using_a_x
+
+
+\ set/reset column mode (DECCOLM)
+.*set_reset_column_mode
+    \ We don't support 132 column mode, so we don't track this mode.
+    \ We do however perform the associated operations.
+    jsr reset_top_bottom_margins
+    ldx #0:ldy #0:jsr set_both_cursor_positions_logical_x_y_no_bounds_checking
+    jmp erase_screen_subroutine
+
+
+\ set/reset screen mode (DECSCNM). Here 'screen mode' is DEC terminology and
+\ means normal or reverse video for the screen as a whole; this has nothing
+\ to do with Acorn screen modes.
+.set_reset_screen_mode
+{
+    \ We swap the two colours over to effect this change, so we must only do
+    \ this if the new mode isn't the same as the old mode. Swapping preserves
+    \ any changes the user might have made (e.g. redefining 0 as blue instead of
+    \ black).
+    ldy #vt102_flags_offset:lda (oswrch_ww),y:sta oswrch_ul
+    lda #vt102_flag_screen_mode:jsr update_vt102_flags_using_a_x
+    ldy #vt102_flags_offset:lda (oswrch_ww),y:cmp oswrch_ul:beq set_reset_text_cursor_enable_mode_rts
+
+    \ We can't use our workspace with the OSWORD calls to read/write the
+    \ palette; this fails on a Master if our workspace is in high private RAM.
+    \ We therefore use 10 bytes on the stack.
+    tsx:stx oswrch_tl
+    txa:sec:sbc #10:tax:txs
+    \ workspace is at stack+1+x=&101+x
+    inx:stx oswrch_vl
+    lda #hi(stack):sta oswrch_vh
+    lda #0:ldy #0:jsr read_logical_colour_a_to_offset_y
+    lda #1:ldy #5:jsr read_logical_colour_a_to_offset_y
+    lda #0:ldy #5:jsr write_logical_colour_a_from_offset_y
+    lda #1:ldy #0:jsr write_logical_colour_a_from_offset_y
+    ldx oswrch_tl:txs
+    rts
+
+.read_logical_colour_a_to_offset_y
+    ldx #osword_read_palette
+    xbne_always common
+.write_logical_colour_a_from_offset_y
+    ldx #osword_write_palette
+.common
+    sta (oswrch_v),y
+    txa:pha
+    tya:clc:adc oswrch_vl:tax
+    ldy #hi(stack)
+    pla
+    jmp osword
+}
+
+
+\ set/reset cursor key mode (DECCKM)
+.set_reset_cursor_key_mode
+    lda #vt102_flag_cursor_key_mode:jsr update_vt102_flags_using_a_x
+    fall_through_to set_key_maps_from_modes
+
+\ Set the key maps used by the INSV handler according to the current keypad
+\ mode, cursor key mode and ANSI/VT52 mode settings.
+.set_key_maps_from_modes
+{
+    \ This code relies on these exact bit values to generate offsets into
+    \ cursor_key_mode_maps and keypad_key_mode_maps.
+    assert vt102_flag_keypad_mode     == 1
+    assert vt102_flag_cursor_key_mode == 2
+    assert vt102_flag_ansi_mode       == 4
+
+    \ We must disable interrupts when updating cursor_key_map and
+    \ keypad_key_map, otherwise the INSV handler could see an invalid
+    \ intermediate state.
+    php:sei
+
+    \ Alternate entry point for code which has already done the php:sei itself;
+    \ can only be entered via JMP as otherwise the stacked flags would be hidden
+    \ beneath the return address pushed by JSR.
+.^set_key_maps_from_modes_flags_stacked
+    xassert_oswrch_ww_valid
+    xassert_interrupts_disabled
+
+    ldy #vt102_flags_offset:lda (oswrch_ww),y:pha
+    and #(vt102_flag_ansi_mode or vt102_flag_cursor_key_mode):tax
+    ldy #cursor_key_map_offset:lda cursor_key_mode_maps,x:sta (oswrch_ww),y
+    iny:lda cursor_key_mode_maps+1,x:sta (oswrch_ww),y
+
+    pla \ A is vt102_flags
+    and #(vt102_flag_ansi_mode or vt102_flag_keypad_mode)
+    sta oswrch_tl
+    asl a:ora oswrch_tl
+    and #%110
+    \ A now has ANSI flag in bit 2 and keypad flag in bit 1, all other bits
+    \ clear.
+    tax
+    assert keypad_key_map_offset == cursor_key_map_offset + 2
+    iny:lda keypad_key_mode_maps,x:sta (oswrch_ww),y
+    iny:lda keypad_key_mode_maps+1,x:sta (oswrch_ww),y
+
+    plp
+    rts
+
+.cursor_key_mode_maps
+    equw cursor_key_map_vt52
+    equw cursor_key_map_vt52
+    equw cursor_key_map_ansi_ckm_reset
+    equw cursor_key_map_ansi_ckm_set
+
+.keypad_key_mode_maps
+    equw keypad_key_map_vt52_numeric_mode
+    equw keypad_key_map_vt52_application_mode
+    equw keypad_key_map_ansi_numeric_mode
+    equw keypad_key_map_ansi_application_mode
+}
+
+
+{
+\ We've seen <ESC>= (DECKPAM)
+.*application_keypad_mode
+    ldx #1
+    xbne_always common
+
+\ We've seen <ESC>> (DECKPNM)
+.*numeric_keypad_mode
+    ldx #0
+.common
+    \ We must disable interrupts before modifying vt102_flag_keypad_mode and
+    \ keep them disabled through set_key_maps_from_modes, otherwise the INSV
+    \ handler could see the new value of vt102_flag_keypad_mode before
+    \ keypad_key_map has been updated. (It's only because the INSV handler looks
+    \ at both of these related things that this matters; the cursor key mode is
+    \ communicated to the INSV handler only via the key map and so it suffices
+    \ to disable interrupts only inside set_key_maps_from_modes.)
+    php:sei
+    lda #vt102_flag_keypad_mode:jsr update_vt102_flags_using_a_x
+    jmp set_key_maps_from_modes_flags_stacked
+}
+
+
+{
+\ We've seen <ESC>...0 (SCS)
+.*select_character_set_special
+    ldx #character_set_special
+    assert character_set_special != 0
+    xbne_always select_character_set_common
+
+\ We've seen <ESC>...1 (SCS)
+.*select_character_set_alternate
+    ldx #character_set_alternate
+    assert character_set_alternate != 0
+    xbne_always select_character_set_common
+
+\ We've seen <ESC>...2 (SCS)
+.*select_character_set_alternate_special
+    ldx #character_set_alternate_special
+    assert character_set_alternate_special != 0
+    xbne_always select_character_set_common
+
+\ We've seen <ESC>...A (SCS)
+.*select_character_set_uk
+    ldx #character_set_uk
+    assert character_set_uk != 0
+    xbne_always select_character_set_common
+
+\ We've seen <ESC>...B (SCS)
+.*select_character_set_us
+    ldx #character_set_us
+    fall_through_to select_character_set_common
+
+.select_character_set_common
+    jsr get_first_pending_escape_character
+    cmp #'(':beq g0
+    cmp #')':beq g1
+    rts
+.g0
+    ldy #character_set_pointers_offset+character_set_pointer_g0
+    xbne_always g0_g1_common
+.g1
+    ldy #character_set_pointers_offset+character_set_pointer_g1
+.g0_g1_common
+    xassert_oswrch_ww_valid
+    txa:sta (oswrch_ww),y
+    jmp update_fast_path_flags
+}
+
+
+\ We've seen <ESC>c (RIS)
+.*reset_initial_state
+    jsr reset_terminal_except_erase_screen
+    jsr erase_screen_subroutine
+    jmp cursor_home_upper_left
+
+\ Reset the terminal but don't clear the screen or move the cursor; this allows
+\ us to do a pseudo-reset when we're first turned on and take over control from
+\ the OS VDU drivers "transparently".
+.*reset_terminal_except_erase_screen
+{
+    \ Reset (DEC) screen mode (i.e. reverse video); we do this first because we
+    \ need to see the current value of vt102_flag_screen_mode before the
+    \ following code resets it.
+    ldx #0:jsr set_reset_screen_mode
+
+    xassert_oswrch_ww_valid
+    lda #(vt102_flag_ansi_mode or vt102_flag_auto_wrap_mode or vt102_flag_auto_repeat_mode)
+    ldy #vt102_flags_offset:sta (oswrch_ww),y
+    jsr reset_top_bottom_margins
+    jsr set_default_tab_stops
+    jsr flush_input_buffer
+
+    \ Zero various bits of workspace.
+    lda #0
+    ldy #current_character_attributes_offset:sta (oswrch_ww),y
+    ldy #no_scroll_offset:sta (oswrch_ww),y
+    assert no_scroll_offset + 1 == keypad_emulation_offset
+    iny:sta (oswrch_ww),y
+    assert keypad_emulation_offset + 1 == stored_screen_start_line_offset
+    iny:sta (oswrch_ww),y
+    \ Clear fast_path_flags; this sets replace mode and no auto-wrap pending.
+    \ We'll update_fast_path_flags later to update all the other bits based on
+    \ the current state.
+    ldy #fast_path_flags_offset:sta (oswrch_ww),y
+
+    ldx #1:jsr set_reset_text_cursor_enable_mode
+
+    jsr set_key_maps_from_modes
+
+    \ We want to set the OS auto-repeat mode to reflect the new flags, but we
+    \ must only do this if we're enabled (which we might not be if the terminal
+    \ is being reset as part of being turned on but we're in an unsupported
+    \ mode), otherwise our settings take effect when we're in an unsupported
+    \ mode, which is wrong.
+    ldy #emulation_disabled_offset:bne disabled
+    jsr set_our_keyboard_settings \ update OS with new auto-repeat mode
+.disabled
+
+    lda #character_set_pointer_g0:ldy #current_character_set_pointer_offset:sta (oswrch_ww),y
+    \ TODO: It might be desirable to allow these, especially G2 and G3 (which
+    \ can't be altered via escape sequences) to be set via a * command. Another
+    \ possibility here might be to support as an extension the VT220 '*'
+    \ and '+' intermediate characters to indicate G2/G3 respectively in SCS
+    \ commands, where '(' and ')' already represent G0/G1 respectively. We may
+    \ also want to allow character_set_pointer_vt52_graphics to be amended
+    \ as part of supporting true VT52 graphics characters, but there are
+    \ several different options there.
+    jsr set_g0_g1_to_us
+    lda #character_set_uk
+    ldy #character_set_pointers_offset+character_set_pointer_g2:sta (oswrch_ww),y
+    lda #character_set_special
+    assert character_set_pointer_g2 + 1 == character_set_pointer_g3
+    iny:sta (oswrch_ww),y
+    assert character_set_pointer_g3 + 1 == character_set_pointer_vt52_graphics
+    iny:sta (oswrch_ww),y
+
+    jsr update_fast_path_flags
+
+    \ Save the cursor attributes; this means that a restore without any explicit
+    \ save will restore sensible values, because we execute this code when we're
+    \ first enabled.
+    fall_through_to save_cursor_attrs
+}
+
+
+\ We've seen <ESC>7 (DECSC)
+.*save_cursor_attrs
+{
+    xassert_oswrch_ww_valid
+
+    assert vt102_flags_offset + 1 == saved_vt102_flags_offset
+    ldy #vt102_flags_offset:lda (oswrch_ww),y
+    and #vt102_flags_save_mask
+    iny:sta (oswrch_ww),y
+
+    assert saved_vt102_flags_offset + 1 == fast_path_flags_offset
+    assert fast_path_flags_offset + 1 == saved_fast_path_flags_offset
+    iny:lda (oswrch_ww),y
+    and #fast_path_flags_save_mask
+    iny:sta (oswrch_ww),y
+
+    ldx #(attribute_block_size-1)
+    assert saved_fast_path_flags_offset + 1 == attribute_block_offset
+    iny \ i.e. Set Y=attribute_block_offset
+    lda #(attribute_save_block_offset-attribute_block_offset):sta oswrch_tl
+    lda oswrch_ww+1:sta oswrch_th
+.loop
+    lda (oswrch_ww),y:sta (oswrch_t),y
+    iny:dex:bpl loop
+
+.^save_cursor_attrs_rts
+    rts
+}
+
+
+\ Set the G0 and G1 character set pointers to the US character set.
+.set_g0_g1_to_us
+    xassert_oswrch_ww_valid
+    lda #character_set_us
+    ldy #character_set_pointers_offset+character_set_pointer_g0:sta (oswrch_ww),y
+    assert character_set_pointer_g0 + 1 == character_set_pointer_g1
+    iny:sta (oswrch_ww),y
+    rts
+
+
+\ We've seen <ESC>...8 (DECRC or DECALN)
+.*decrc_or_decaln
+{
+    xassert_oswrch_ww_valid
+    jsr get_first_pending_escape_character
+    beq restore_cursor_attrs
+    cmp #'#':bne save_cursor_attrs_rts
+    fall_through_to screen_alignment_display
+
+
+\ We've seen <ESC>#8 (DECALN)
+\ This doesn't really belong in this source file, but we include it here as it's
+\ convenient to keep it adjacent to decrc_or_decaln
+.screen_alignment_display
+    \ We arguably don't need to erase the screen given we're about to fill
+    \ it with Es, but if nothing else this will conveniently reset all the
+    \ line attributes.
+    jsr erase_screen_subroutine
+
+    ldy #emulated_screen_lines_offset:lda (oswrch_ww),y:sec:sbc #1
+    ldy #vt102_cursor_y_offset:sta (oswrch_ww),y
+.y_loop
+    \ We maintain two X counts; one on the stack which counts down, the other in
+    \ vt102_logical_cursor_x which counts up. The main reason for this is that
+    \ print_character will advance vt102_logical_cursor_x *as long as it's less
+    \ than 79*, which makes using this to count up awkward.
+    lda #79:pha
+    lda #0:ldy #vt102_logical_cursor_x_offset:sta (oswrch_ww),y
+.x_loop
+    \ Update the stored screen
+    assert user_option_stored_screen == 1<<7
+    ldy #user_options_offset:lda (oswrch_ww),y:bpl no_stored_screen
+    \ Get the X co-ordinate in Y; note that this uses the stacked value which
+    \ starts at 79 and counts down, so we write to the video RAM from left to
+    \ right but to the stored screen from right to left. This is harmless but
+    \ slightly eccentric; we do it because it only takes three bytes to populate
+    \ Y here, whereas reading vt102_logical_cursor_x into Y would take five
+    \ bytes.
+    pla:pha:tay \ X co-ordinate
+    ldx #0 \ character attributes
+    lda #'E'
+    jsr set_stored_character
+.no_stored_screen
+    \ Update the video RAM
+    lda #'E'
+    ldx #0 \ character attributes
+    ldy #0 \ line attributes
+    jsr print_character \ advances vt102_logical_cursor_x
+    pla:sec:sbc #1:pha:bpl x_loop
+    pla
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:sec:sbc #1:sta (oswrch_ww),y
+    bpl y_loop
+
+    jmp cursor_home_upper_left
+}
+
+
+\ We've seen <ESC>8 (DECRC)
+.restore_cursor_attrs
+    assert vt102_flags_offset + 1 == saved_vt102_flags_offset
+    ldy #vt102_flags_offset:lda (oswrch_ww),y
+    xand_not vt102_flags_save_mask
+    iny:ora (oswrch_ww),y
+    dey:sta (oswrch_ww),y
+
+    assert fast_path_flags_offset + 1 == saved_fast_path_flags_offset
+    ldy #fast_path_flags_offset:lda (oswrch_ww),y
+    xand_not fast_path_flags_save_mask
+    iny:ora (oswrch_ww),y
+    dey:sta (oswrch_ww),y
+
+    ldx #(attribute_block_size-1)
+    ldy #attribute_block_offset
+    lda #(attribute_save_block_offset-attribute_block_offset):sta oswrch_tl
+    lda oswrch_ww+1:sta oswrch_th
+.loop
+    lda (oswrch_t),y:sta (oswrch_ww),y
+    iny:dex:bpl loop
+
+    assert vt102_logical_cursor_x_offset + 1 == vt102_cursor_y_offset
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:tax
+    iny:lda (oswrch_ww),y:tay
+    \ The saved cursor Y position may lie outside the emulated screen, if the
+    \ mode has changed or the user has explicitly changed the emulated screen
+    \ size, so we must constrain Y appropriately. We don't want to constrain to
+    \ reflect origin mode; see the test srom-1.dat.
+    jsr clamp_y_to_screen
+    jsr set_both_cursors_to_logical_x_in_x_and_y_in_y
+    fall_through_to update_fast_path_flags
+
+
+\ Update fast_path_flags to reflect the current state of the emulation; if this
+\ isn't called, subtle problems will occur as the fast path will be used when it
+\ isn't appropriate. (Setting fast_path_enabled to FALSE may help determine
+\ whether a bug is related to the fast path handling or not.)
+.*update_fast_path_flags
+{
+    xassert_oswrch_ww_valid
+    ldy #fast_path_flags_offset:lda (oswrch_ww),y
+
+    \ Some flags in fast_path_flags (fast_path_insert_mode,
+    \ fast_path_auto_wrap_pending, fast_path_temporary_character_set_ptr)
+    \ are first-class flags - they aren't derived from information held
+    \ elsewhere. They are therefore always up-to-date and we don't touch
+    \ them. We clear everything else and then set the bits as appropriate
+    \ based on the current state.
+    and #(fast_path_insert_mode or fast_path_auto_wrap_pending or fast_path_temporary_character_set_pointer)
+    tax
+
+    ldy #emulation_disabled_offset:lda (oswrch_ww),y
+    beq not_disabled
+    txa:ora #fast_path_disabled:tax
+.not_disabled
+
+    ldy #escape_seq_len_offset:lda (oswrch_ww),y
+    bmi not_in_escape_sequence
+    txa:ora #fast_path_in_escape:tax
+.not_in_escape_sequence
+
+    jsr get_current_line_attributes:beq no_line_attributes
+    txa:ora #fast_path_some_line_attributes:tax
+.no_line_attributes
+
+    ldy #current_character_attributes_offset:lda (oswrch_ww),y
+    beq no_character_attributes
+    txa:ora #fast_path_some_character_attributes:tax
+.no_character_attributes
+
+    ldy #current_character_set_pointer_offset:lda (oswrch_ww),y 
+    clc:adc #character_set_pointers_offset:tay
+    lda (oswrch_ww),y
+    cmp #character_set_special \ the only non-text character set
+    bne text_character_set
+    txa:ora #fast_path_non_text_character_set:tax
+.text_character_set
+
+    txa
+    ldy #fast_path_flags_offset:sta (oswrch_ww),y
+    
+    rts
+}
+
+
+\ Set the top and bottom margins so the scrolling region fills the entire
+\ emulated screen.
+.*reset_top_bottom_margins
+    xassert_oswrch_ww_valid
+    lda #0:ldy #top_margin_offset:sta (oswrch_ww),y
+    ldy #emulated_screen_lines_offset:lda (oswrch_ww),y
+    sec:sbc #1:ldy #bottom_margin_offset:sta (oswrch_ww),y
+    rts
+
+} \ close file scope

@@ -1,0 +1,374 @@
+\ memmove.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Optimised code for copying overlapping blocks of memory; like C's memmove() but
+\ with additional support for wrapping addresses to a certain window.
+
+\ The algorithm for this code was sketched out in C first and an attempt
+\ has been made to keep the two in sync; see pseudo.c.
+
+{ \ open file scope
+
+\ Input parameters
+from = oswrch_t
+to = oswrch_u
+wrap_bottom_high = oswrch_vl
+wrap_top_high = oswrch_vh
+
+\ Internal workspace
+chunk_size = oswrch_w
+
+
+\ Common code factored out of the memmove chunk loops.
+\
+\ On entry:
+\   count has been stacked
+\   X=to or from
+\
+\ On exit:
+\   If count is zero, returns directly to caller's caller.
+\   Otherwise:
+\     if X=from, chunk_size = min(from, to) + Y
+\     if X=to,   chunk_size = max(from, to) + Y
+.chunk_size_min_max
+{
+    stx chunk_size
+
+    \ If count == 0, we're done. 
+    tsx:lda stack+3,x:ora stack+4,x:beq count_is_0
+
+    ldx chunk_size
+    lda from+1:cmp to+1:bcc from_lt_to:bne from_gt_to
+    lda from:cmp to:bcc from_lt_to
+.from_gt_to
+    \ Toggle X between 'from' and 'to'
+    eor_toggle = from eor to
+    assert from eor eor_toggle == to
+    assert to eor eor_toggle == from
+    txa:eor #eor_toggle:tax
+.from_lt_to
+    clc:tya:adc &00,x:sta chunk_size
+    lda #0:adc &01,x:sta chunk_size+1
+    rts
+
+.count_is_0
+    \ Discard the return address stacked by our immediate caller.
+    pla:pla
+    
+.^discard_count_rts
+    \ Discard the two bytes stacked for count.
+    pla:pla
+
+    rts
+}
+
+
+.memmove_from_lt_to_indirect
+    jmp memmove_from_lt_to
+
+
+\ Copy YX bytes from T to U; the from and to ranges may overlap.
+\ Standard wrapping is applied to keep the addresses actually read/written
+\ within the range &(VL)00-&(VH)00
+\
+\ Preserves: nothing (including W)
+.*memmove
+    \ Stack YX=count; we work with this in place on the stack.
+    tya:pha:txa:pha
+
+    \ Return immediately if from == to, otherwise enter the appropriate one of
+    \ memmove_from_gt_to or memmove_from_lt_to.
+    lda from+1:cmp to+1:bcc memmove_from_lt_to_indirect:bne memmove_from_gt_to
+    lda from:cmp to:bcc memmove_from_lt_to_indirect:beq discard_count_rts
+    fall_through_to memmove_from_gt_to
+
+
+\ As memmove, but the caller guarantees from > to.
+.memmove_from_gt_to
+{
+    jsr memmove_common_initialisation
+
+    \ We go round the following loop no more than three times, each time moving
+    \ a chunk of memory which involves no wrapping around.
+.chunk_loop
+    \ Check count != 0 and calculate chunk_size =
+    \   min(count, wrap_top - (from + y), wrap_top - (to + y))
+    \
+    \ Note that we may have (from + y) < (to + y) or (from + y) > (to + y)
+    \ (because we may have wrapped) but we do know (from + y) != (to + y).
+    ldx #to:jsr chunk_size_min_max \ chunk_size = max(from + y, to + y)
+    lda #0:sec:sbc chunk_size:sta chunk_size
+    lda wrap_top_high:sbc chunk_size+1:sta chunk_size+1
+    \ chunk_size is now min(wrap_top - (from + y), wrap_top - (to + y))
+    jsr update_chunk_size_decrement_count
+    \ We're finished calculating chunk_size.
+
+    \ Is chunk_size>=256-Y or chunk_size<256-Y?
+    \ lda chunk_size+1 - done in update_chunk_size_decrement_count
+    bne chunk_size_ge_256_minus_y
+    \ chunk_size >= 256 - y <=> chunk_size + y >= 256
+    tya:clc:adc chunk_size:bcc chunk_size_lt_256_minus_y
+
+.chunk_size_ge_256_minus_y
+    \ chunk_size -= 256 - y, i.e. chunk_size -= 256; chunk_size += y
+    dec chunk_size+1
+    tya:clc:adc chunk_size:sta chunk_size
+    { bcc no_carry:inc chunk_size+1:.no_carry }
+
+    \ Set X=hi(chunk_size)+1; this is the number of pages or partial pages to
+    \ copy in the core loop.
+    ldx chunk_size+1:inx
+
+    \ We conceptually want to do chunk_size=lo(chunk_size) here, but
+    \ we don't actually need to bother; all control paths reaching
+    \ chunk_size_lt_256_minus_y know the high byte of chunk_size is
+    \ conceptually zero and don't try to read it from chunk_size+1.
+
+    \ Core loop; copy X pages or partial pages, starting with the current
+    \ Y and incrementing. On the first pass only, Y may have any value,
+    \ so do a few passes until it's a multiple of 8.
+.y_loop_arbitrary_y
+    tya:and #%111:beq y_loop_y_multiple_of_8
+    lda (from),y:sta (to),y:iny
+    bne y_loop_arbitrary_y
+    xbeq_always y_is_0
+.x_loop
+.y_loop_y_multiple_of_8
+    for i, 1, 8
+        lda (from),y:sta (to),y:iny
+    next
+    bne y_loop_y_multiple_of_8
+.y_is_0
+    inc from+1
+    inc to+1
+    dex:bne x_loop
+    \ This assertion is a little excessive; we'd get almost the full benefit
+    \ from just asserting that bne y_loop_y_multiple_of_8 above is on the same
+    \ page.
+    xassert_branch_on_same_page x_loop
+
+    \ Wrap if from + Y or to + Y has crossed wrap_top. Since the low byte
+    \ of from is 0, we can just check the high byte of from for a wrap,
+    \ but we must calculate to + Y properly. (As it happens, if we enter
+    \ this code after the x_loop/y_loop above, we know Y is zero, but we
+    \ also enter this code at wrap_to_if_required where Y may not be zero.)
+    lda from+1:jsr wrap_at_top_if_required:sta from+1
+.wrap_to_if_required
+    tya:clc:adc to
+    lda #0:adc to+1:cmp wrap_top_high:bcc dont_wrap_to
+    lda to+1:jsr wrap_at_top_unconditionally
+    sta to+1
+.dont_wrap_to
+
+.chunk_size_lt_256_minus_y
+    \ At this point we know chunk_size is <256, and in fact the byte at
+    \ chunk_size+1 is junk.
+    ldx chunk_size:beq chunk_loop_indirect
+    \ Copy the remaining chunk_size bytes to finish this chunk. We don't unroll
+    \ this loop; I've profiled it and speed.bas would finish <0.1 seconds faster
+    \ if we did.
+.tail_loop
+    lda (from),y:sta (to),y:iny
+    dex:bne tail_loop
+    stx chunk_size
+    \ Wrap if to + Y has crossed wrap_top.
+    xbeq_always wrap_to_if_required
+.chunk_loop_indirect
+    jmp chunk_loop
+}
+
+
+\ As memmove, but the caller guarantees from < to.
+.memmove_from_lt_to
+{
+    \ We have YX = count, set from += count - 1 and to += count - 1. (If count
+    \ == 0 this is irrelevant, as we'll detect that at the top of chunk_loop.)
+    { txa:bne no_borrow:dey:.no_borrow:dex }
+    txa:clc:adc from:sta from
+    tya:adc from+1:sta from+1
+    txa:clc:adc to:sta to
+    tya:adc to+1:sta to+1
+
+    jsr memmove_common_initialisation
+    
+    \ We go round the following loop no more than three times, each time moving
+    \ a chunk of memory which involves no wrapping around.
+.chunk_loop
+    \ Check count != 0 and calculate chunk_size = 
+    \   min(count, 1 + from + y - wrap_bottom, 1 + to + y - wrap_bottom)
+    \
+    \ Note that we may have (from + y) < (to + y) or (from + y) > (to + y)
+    \ (because we may have wrapped) but we do know (from +y) != (to + y).
+    ldx #from:jsr chunk_size_min_max \ chunk_size = min(from + y, to + y)  
+    lda wrap_bottom_high:eor #&ff:sec:adc #0 \ A=-wrap_bottom_high
+    clc:adc chunk_size+1:sta chunk_size+1
+    { inc chunk_size:bne no_carry:inc chunk_size+1:.no_carry }
+    \ chunk_size is now min(1 + from + y - wrap_bottom, 1 + to + y - wrap_bottom)
+    jsr update_chunk_size_decrement_count
+    \ We're finished calculating chunk_size.
+
+    \ Is chunk_size>=Y+1 or chunk_size<Y+1?
+    \ lda chunk_size+1 - done in update_chunk_size_decrement_count
+    bne chunk_size_ge_y_plus_1
+    cpy chunk_size
+    bcs chunk_size_lt_y_plus_1 \ C set means Y>=chunk_size <=> Y+1>chunk_size
+
+.chunk_size_ge_y_plus_1
+    \ chunk_size -= Y + 1
+    { 
+        iny:beq wrap
+        tya:eor #&ff:sec:adc chunk_size:sta chunk_size
+        bcs no_borrow
+    .wrap
+        dec chunk_size+1
+    .no_borrow
+        dey
+    }
+
+    \ X=hi(chunk_size)+1
+    ldx chunk_size+1:inx
+
+    \ We conceptually want to do chunk_size=lo(chunk_size) here, but we don't
+    \ actually need to bother; all control paths reaching chunk_size_lt_y_plus_1
+    \ know its high byte is zero and don't try to read it from chunk_size+1.
+
+    \ Core loop; copy X pages or partial pages, starting with the current Y and
+    \ decrementing. On the first pass only, Y may start with any value so if
+    \ it's 0 we need to special case that to avoid problems with Y wrapping and
+    \ otherwise we need to do a pre-loop until it's a multiple of 8 and the
+    \ unrolled loop body can be used. On subsequent passes we know Y=255 and we
+    \ enter at x_loop.
+    tya:beq y_is_0
+.y_loop_arbitrary_y
+    tya:and #%111:beq y_loop_y_multiple_of_8
+    lda (from),y:sta (to),y:dey
+    bne y_loop_arbitrary_y
+    xbeq_always y_is_0
+.y_loop_y_multiple_of_8
+    \ We unroll the loop body 8 times; control transfers in after the first
+    \ pass over the unrolled body at x_loop, since Y=255=31*8+7 at that point.
+    lda (from),y:sta (to),y:dey
+.x_loop
+    for i, 1, 7
+        lda (from),y:sta (to),y:dey
+    next
+    bne y_loop_y_multiple_of_8
+    xassert_branch_on_same_page y_loop_y_multiple_of_8
+.y_is_0
+    lda (from),y:sta (to),y:dey
+    dec from+1
+    dec to+1
+    dex:bne x_loop
+    \ This assertion is a little excessive; we'd get almost the full benefit
+    \ from just asserting that bne y_loop_y_multiple_of_8 above is on the same
+    \ page.
+    xassert_branch_on_same_page x_loop
+
+    \ Wrap from+y and to+y if they've gone below wrap_bottom. Since the low byte
+    \ of from is 0, we can get away with just using from instead of from+y, but
+    \ we must calculate to+y properly.
+    lda from+1:cmp wrap_bottom_high:bcs from_ge_wrap_bottom
+    \ from += wrap_top - wrap_bottom
+    xclc:adc wrap_top_high
+    sec:sbc wrap_bottom_high
+    sta from+1
+.from_ge_wrap_bottom
+.wrap_to_if_required
+    tya:clc:adc to
+    lda #0:adc to+1 \ A=high byte of to+y
+    cmp wrap_bottom_high:bcs to_plus_y_ge_wrap_bottom
+    \ to += wrap_top - wrap_bottom
+    \ xclc - unfortunately the extra code emitted in a debug build causes
+    \ a relative branch to fail
+    adc wrap_top_high
+    sec:sbc wrap_bottom_high
+    sta to+1
+.to_plus_y_ge_wrap_bottom
+
+.chunk_size_lt_y_plus_1
+    \ At this point we know chunk_size is <256, and in fact the byte at
+    \ chunk_size+1 is junk.
+    
+    ldx chunk_size:beq chunk_loop_indirect
+    \ Copy the remaining chunk_size bytes to finish this chunk. We don't
+    \ unroll this loop; I've profiled it and speed.bas would finish <0.1
+    \ seconds faster if we did. TODO: Other tests suggest this does get
+    \ some moderately heavy use, so it's a bit borderline, but my current
+    \ inclination is that it isn't worth it.
+.tail_loop
+    lda (from),y:sta (to),y:dey
+    dex:bne tail_loop
+    stx chunk_size
+    \ Wrap to+Y if it's gone below wrap_bottom. (from+Y can't have gone below
+    \ wrap_bottom, since the low byte of from is always 0 and so only
+    \ decrementing the high byte of from can make it go below wrap_bottom, and
+    \ we haven't done that here - we've only decremented Y.)
+    xbeq_always wrap_to_if_required
+.chunk_loop_indirect
+    jmp chunk_loop
+}
+
+
+\ Wrap A if it's at or above wrap_top_high.
+.wrap_at_top_if_required
+{
+    cmp wrap_top_high:bcc dont_wrap
+\ Wrap A unconditionally
+.^wrap_at_top_unconditionally
+    xsec:sbc wrap_top_high
+    clc:adc wrap_bottom_high
+.dont_wrap
+    rts
+}
+
+
+\ Common initialisation code factored out to avoid duplication.
+.memmove_common_initialisation
+{
+    \ Check for wrapping around at wrap_top
+    lda from+1:jsr wrap_at_top_if_required:sta from+1
+    lda to+1:jsr wrap_at_top_if_required:tax \ X temporarily plays role of to+1
+
+    \ Set the low byte of from to 0 and leave Y containing the old low byte;
+    \ this sets us up for LDA (from),Y access with no page crossing penalty.
+    \ Adjust to so that STA (to),Y with the same Y accesses the corresponding to
+    \ byte.
+    lda to:sec:sbc from:sta to
+    txa:sbc #0:sta to+1
+    ldy from:lda #0:sta from
+
+    rts
+}
+
+
+\ On entry:
+\   count is on the stack (above the return address pushed by our caller)
+\
+\ On exit:
+\   chunk_size = min(count, chunk_size)
+\   count -= chunk_size
+\   A contains new chunk_size+1 and flags reflect value in A
+.update_chunk_size_decrement_count
+{
+    tsx
+    lda stack+4,x:cmp chunk_size+1:bcc count_lt_chunk_size:bne count_ge_chunk_size
+    lda stack+3,x:cmp chunk_size:bcs count_ge_chunk_size
+.count_lt_chunk_size
+    lda stack+3,x:sta chunk_size
+    lda stack+4,x:sta chunk_size+1
+.count_ge_chunk_size
+
+    \ count -= chunk_size
+    lda stack+3,x:sec:sbc chunk_size:sta stack+3,x
+    lda stack+4,x:sbc chunk_size+1:sta stack+4,x
+
+    lda chunk_size+1
+    rts
+}
+
+} \ close file scope

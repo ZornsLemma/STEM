@@ -1,0 +1,9 @@
+*.lst
+*.ssd
+*.d
+*.zip
+testcpm.dsd
+src/tests/generated
+tmp
+tags
+table.beebasm

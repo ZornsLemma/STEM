@@ -1,0 +1,37 @@
+[I haven't followed these rules strictly, but I wrote them down to try to come
+up with a style I was happy with.]
+
+Each file designed to be included by the top-level source file should have an
+outermost file scope (with no corresponding indent). One more level of scope is
+fine (this is roughly "function body"); try to avoid a third level of scope
+unless there's a real benefit - bear in mind it might be best just to separate
+off any such code into its own include file. A very short third level scope
+just to have a local label for a few lines of code is fine, it's where the
+third level scopes don't fit entirely on screen it gets confusing.
+
+If a subroutine has a label which is immediately followed by an RTS, the label
+should be '.rts' or '.subroutine_name_rts' - this way a) it's immediately
+obvious that branches to the label RTS without any cleanup b) it's easier to
+re-use the RTS for nearby code which wants to branch to one. A subroutine which
+has "clean up and RTS" code should make sure any associated label doesn't
+follow this convention.
+
+Actual source code is in lower case, including hexadecimal constants.
+Instruction mnemonics inline in English sentences in comments are upper case to
+distinguish them from the surrounding English text.
+
+In general, arithmetic expressions evalulated by the assembler don't contain
+whitespace (e.g. "1<<3" not "1 << 3"); longer and more complex expressions are
+an exception.
+
+TODO: A standard convention on "stack pictures" in comments might be good, also
+how to lay them out in the code (right-indented? start of line?). Perhaps look
+at Forth conventions FWIW.
+
+TODO: Do we brace-delimit subroutine bodies whether or not they contain any
+labels? I'm inconsistent on this.
+
+One blank line between "paragraphs" within a subroutine, or between related
+subroutines; two blank lines between unrelated subroutines.
+
+vi: tw=79

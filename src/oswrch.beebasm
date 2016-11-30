@@ -1,0 +1,1244 @@
+\ oswrch.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Our core OSWRCH handler; this deals with basic character output and dispatches
+\ other output to the relevant routines.
+
+{ \ open file scope
+
+\ Jump table used to dispatch different control characters to a suitable
+\ handler routine.
+\
+\ A real VT102 would ignore some of these, but we pass them through to the
+\ OS VDU handler instead (if user_option_ignore_unsupported isn't set).
+\
+\ TODO: We could implement support for answerback, but we currently don't,
+\ so ETX is just passed through to the OS VDU driver and there's no way
+\ to transmit the answerback message from the keyboard (CTRL-BREAK/HERE IS
+\ on a real VT102). I imagine an implementation of this would provide a *
+\ command to set the answerback message. To some extent, the ability to
+\ press SHIFT+fn to insert the *KEYn character string into the keyboard
+\ buffer replaces the function of transmitting the answerback message from
+\ the keyboard. Possibly we could permanently appropriate the *KEY9 string
+\ as the answerback string and transmit that if ETX is seen, instead of
+\ providing a separate answerback string with its own * command to set.
+\
+\ I don't think EOT and ENQ make much sense in the context of this emulation so
+\ they're just passed through to the OS VDU driver.
+\
+\ TODO: It might be nice to allow BEL to act as an audio and/or visual (screen
+\ flash) bell, at the user's option.
+.control_character_jump_table
+    equh acorn_control_character    \  0 &00 000 NUL
+    equh acorn_control_character    \  1 &01 001 -
+    equh acorn_control_character    \  2 &02 002 -
+    equh acorn_control_character    \  3 &03 003 ETX no emulated VT102 function
+    equh acorn_control_character    \  4 &04 004 EOT no emulated VT102 function
+    equh acorn_control_character    \  5 &05 005 ENQ no emulated VT102 function
+    equh acorn_control_character    \  6 &06 006 -
+    equh common_control_character   \  7 &07 007 BEL Acorn == VT102
+    equh vt102_backspace	    \  8 &08 010 BS
+    equh vt102_horizontal_tab	    \  9 &09 011 HT
+    equh vt102_line_feed	    \ 10 &0A 012 LF
+    equh vt102_line_feed            \ 11 &0B 013 VT Handle as LF
+    equh vt102_line_feed	    \ 12 &0C 014 FF Handle as LF
+    equh vt102_carriage_return	    \ 13 &0D 015 CR
+    equh vt102_shift_out	    \ 14 &0E 016 SO
+    equh vt102_shift_in		    \ 15 &0F 017 SI
+    equh acorn_control_character    \ 16 &10 020 -
+    equh acorn_control_character    \ 17 &11 021 DC1 no emulated VT102 function
+    equh acorn_control_character    \ 18 &12 022 -
+    equh acorn_control_character    \ 19 &13 023 DC3 no emulated VT102 function
+    equh acorn_control_character    \ 20 &14 024 -
+    equh acorn_control_character    \ 21 &15 025 -
+    equh acorn_control_character    \ 22 &16 026 -
+    equh acorn_control_character    \ 23 &17 027 -
+    equh vt102_cancel               \ 24 &18 030 CAN
+    equh acorn_control_character    \ 25 &19 031 -
+    equh vt102_cancel               \ 26 &1A 032 SUB Handle as CAN
+    equh vt102_escape		    \ 27 &1B 033 ESC
+    equh acorn_control_character    \ 28 &1C 034 -
+    equh acorn_control_character    \ 29 &1D 035 -
+    equh acorn_control_character    \ 30 &1E 036 -
+    equh acorn_control_character    \ 31 &1F 037 -
+.control_character_jump_table_end
+assert control_character_jump_table_end - control_character_jump_table == 2*32
+
+
+\ OSWRCH is performance-critical for ordinary text output; much less so for
+\ things like escape sequence processing or output of fancy formatted text. We
+\ go out of our way to ensure that we can process straightforward text output as
+\ efficiently as possible, the so-called "fast path". What's "straightforward"?
+\ - we're not disabled
+\ - we're not in the middle of processing an escape sequence
+\ - we're not in the middle of a multi-byte VDU sequence
+\ - we're not *SPOOLing output to a file
+\ - we're outputting plain text with no character or line attributes
+\ - we're outputting text not special graphics characters
+\ - we're not using a temporary character set pointer
+\ - we're not in insert mode
+\ - we're not outputting in column 79
+\ - we're outputting a character which encode_character would encode to itself,
+\   i.e. one where Acorn and VT102 character sets match, *or* a carriage return
+\   (CR, 13)
+\
+\ In order to aid optimisation, we have separate OSWRCH handlers for the 
+\ BBC B/B+ and the Master; these share code once they've determined they're not
+\ handling the fast path. Both of them naturally share the same API.
+\
+\ Because some of the fast path code is equally applicable to both, but we don't
+\ want to pay for the overhead of a subroutine call, we have some macros to
+\ factor it out.
+\
+\ We don't try to support the various options available via *FX3 in our OSWRCH
+\ handler.
+
+\ Advance the hardware cursor. Handily the relevant CRTC registers are
+\ read/write and count in character increments. We don't have to worry about
+\ wrapping here because we're advancing within a single line (a line in
+\ screen memory can have a wrap part way through it, but the cursor address
+\ is internal to the CRTC so this wrapping isn't relevant).
+\
+\ This preserves A and X.
+macro advance_hardware_cursor
+    ldy #crtc_register_cursor_position_low
+    sty crtc_register
+    inc crtc_data
+    bne no_carry
+    assert crtc_register_cursor_position_high == crtc_register_cursor_position_low - 1
+    dey
+    sty crtc_register
+    inc crtc_data
+.no_carry
+endmacro
+
+macro our_oswrch_fast_path_common
+    if not(fast_path_enabled)
+        jmp not_fast_path
+    endif
+
+    \ Check if the conditions for the fast path are satisfied; the
+    \ necessary information is maintained in as few places as possible to make
+    \ this check as fast as possible.
+    lda vdu_queue_size
+    ora spool_file_handle
+    ldy #fast_path_flags_offset:ora (oswrch_ww),y
+    bne not_fast_path
+
+    \ Check if the fast path condition that the character encodes to itself is
+    \ satisfied; we do this after the previous test, since if we are on the fast
+    \ path we have to do both, but this avoids slowing down processing of escape
+    \ sequences (which gives a minor boost to e.g. the cursor positioning
+    \ benchmark).
+    ldx oswrch_tl
+    \ All top-bit-set characters encode to themselves and don't have entries in
+    \ fast_path_character_table. TODO: They could, if we have 126 bytes spare
+    \ to save these 2 cycles; it might not cost that much, if some other tables
+    \ could be embedded within the 128 bytes of additional table..
+    bmi encodes_to_itself
+    lda fast_path_character_table,x:bmi not_fast_path
+.encodes_to_itself
+
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y
+    cmp #79:bcs not_fast_path
+
+    \ The conditions for the fast path have been met. Check for the special case
+    \ of a carriage return.
+    cpx #cr:beq carriage_return
+
+    \ It's a regular character, so we need to get the character into the
+    \ video RAM and stored screen ASAP and advance the cursor (both the
+    \ internal position and the hardware cursor) one character. A contains
+    \ vt102_logical_cursor_x
+
+    \ Advance vt102_logical_cursor_x
+    xadc_0_or_inc_a
+    sta (oswrch_ww),y \ increment vt102_logical_cursor_x
+
+    advance_hardware_cursor
+
+    \ Write the character to the stored screen. A contains the logical cursor
+    \ X co-ordinate of the *following* character (since we just advanced the
+    \ cursor position) and X contains the character. We avoid checking for
+    \ the stored screen being disabled immediately, because we don't want to
+    \ penalise the fast path in the case where the stored screen is enabled;
+    \ instead we check at the first convenient point, so there's only a two
+    \ cycle penalty per character when it's not disabled, and when it is
+    \ disabled we still get some benefit from skipping part of this code.
+    {
+	lsr a \ clear C iff logical X co-ordinate of *this* character is odd
+	ldy #stored_screen_cursor_address_offset
+	lda (oswrch_ww),y
+	sta oswrch_ul
+	bcs even
+
+	\ As we're at an odd character, we need to increment
+	\ stored_screen_cursor_address by 3 ready for the next character to
+	\ be written. (We write *our* character at the cursor address before
+	\ incrementing.) We don't need to worry about wrapping as we're in
+	\ the fast path so we're not moving off the current line and a wrap
+	\ can't occur within a stored screen line.
+	xclc
+	adc #3
+	sta (oswrch_ww),y
+	iny:lda (oswrch_ww),y:beq stored_screen_disabled:sta oswrch_uh
+	bcc no_carry:xadc_0_or_inc_a:sta (oswrch_ww),y:.no_carry
+	\ stored_screen_cursor_address has now been incremented and U contains
+	\ the address of the 3-byte grouping for our character.
+
+	\ Clear the attributes for this character.
+	ldy #2
+	lda (oswrch_u),y
+	and #%11110000
+	sta (oswrch_u),y
+
+	dey \ Y=1
+	xbne_always common
+
+    .^carriage_return
+        \ It's a CR; we just need to move the cursor to the start of the current
+        \ line. We may in fact be there already, in which case this is a no-op.
+        \ A contains vt102_logical_cursor_x and Y contains
+        \ vt102_logical_cursor_x_offset.
+        tax:beq fast_path_done_indirect
+
+        sta oswrch_th \ stash old vt102_logical_cursor_x for easy access later
+
+        \ Move vt102_logical_cursor_x back to the start of the line
+        lda #0:sta (oswrch_ww),y
+
+        \ Move the stored screen fast path pointers back to the start of the line
+        ldy #stored_screen_cursor_line_address_offset:lda (oswrch_ww),y
+        ldy #stored_screen_cursor_address_offset:sta (oswrch_ww),y
+        ldy #stored_screen_cursor_line_address_offset+1:lda (oswrch_ww),y
+        ldy #stored_screen_cursor_address_offset+1:sta (oswrch_ww),y
+        
+        \ Move the video RAM fast path pointers back to the start of the line
+        ldy #video_ram_cursor_line_address_offset:lda (oswrch_ww),y
+        ldy #video_ram_cursor_address_offset:sta (oswrch_ww),y
+        ldy #video_ram_cursor_line_address_offset+1:lda (oswrch_ww),y
+        ldy #video_ram_cursor_address_offset+1:sta (oswrch_ww),y
+
+        \ Move the hardware cursor back to the start of the line.
+        ldy #crtc_register_cursor_position_low:sty crtc_register
+        lda crtc_data:sec:sbc oswrch_th:sta crtc_data
+        bcs no_borrow
+        assert crtc_register_cursor_position_high == crtc_register_cursor_position_low - 1
+        dey:sty crtc_register
+        dec crtc_data
+    .no_borrow
+
+        \ We're done with the carriage return case.
+    .fast_path_done_indirect
+        jmp fast_path_done
+
+    .even
+	\ We're at an even character.
+
+	iny:lda (oswrch_ww),y:beq stored_screen_disabled:sta oswrch_uh
+	\ U now contains the address of the 3-byte grouping for our character.
+
+	\ Clear the attributes for this character
+	ldy #2
+	lda (oswrch_u),y
+	and #%00001111
+	sta (oswrch_u),y
+
+	ldy #0
+    .common
+	\ Store the character itself
+	txa \ get character in A
+	sta (oswrch_u),y
+
+    .stored_screen_disabled
+    }
+
+    \ Prepare to write the character to the video RAM; we want to write it
+    \ at the current value of video_ram_cursor_address, which we copy to U,
+    \ and increment video_ram_cursor_address by 8 ready for the next character.
+    {
+	ldy #video_ram_cursor_address_offset:lda (oswrch_ww),y:sta oswrch_ul
+	clc:adc #8:sta (oswrch_ww),y
+	iny:lda (oswrch_ww),y:sta oswrch_uh
+	bcc no_carry
+        xadc_0_or_inc_a
+	bpl no_wrap \ if high byte is >=&80 we need to wrap
+	sec:sbc screen_size_high_byte
+    .no_wrap
+	sta (oswrch_ww),y
+    .no_carry
+    }
+endmacro
+
+
+\ BBC B/B+ OSWRCH handler
+
+{
+.not_fast_path
+    jmp our_oswrch_common_init_done
+
+\ See our_oswrch_master for API; this and that are alternate implementations
+\ of the same API.
+.*our_oswrch_bbc_b
+    lda #0:sta oswrch_ww
+
+    lda oswrch_tl
+    if debug
+        sta debug_oswrch_a
+    endif
+
+    pha:txa:pha:tya:pha
+
+    our_oswrch_fast_path_common
+
+    \ Write the character to the video RAM.
+    {
+	\ U contains the address to write to
+
+	\ Get the address of the character bitmap in V; see
+        \ init_oswrch_v_to_read_only_os_bitmap for a more commented version of
+        \ this code.
+	{
+            txa \ get character in A
+            asl a:asl a:asl a:sta oswrch_vl \ offset within page
+            txa \ get character in A
+	    lsr a:lsr a:lsr a:lsr a:lsr a:tax \ X is offset from bbc_b_font_location_table-1
+	    lda font_explosion_mask_table-1,x:and bbc_b_font_explosion_flags:beq in_rom
+	    \ This character is in RAM
+	    lda bbc_b_font_location_table-1,x
+	    xbne_always high_byte_in_a \ characters will not be stored in page 0
+	.in_rom
+	    txa:clc:adc #hi(bbc_b_bitmaps_base_0)
+	.high_byte_in_a
+            sta oswrch_vh
+	}
+
+	\ Page in video RAM
+	\
+	\ TODO: At least on the Integra-B (and probably on all third-party
+	\ shadow RAM upgrades for the BBC B), the performance of STEM in
+	\ shadow modes is poor, due to the overhead of going through the OS
+	\ to page in shadow RAM for every character output. (The overhead
+	\ when going via page_in_{video,main}_ram is much less significant,
+	\ as they're used by code which does a lot more work in one go.) Short
+	\ of implementing direct hardware support for all the different
+	\ types of shadow RAM, there isn't much to be done about this -
+	\ but at least it does work. Possibly we should record which type
+	\ of shadow RAM we have, so that in the Aries/Watford case we don't
+	\ have to make *two* OS calls to page in the shadow RAM (OSBYTE 108,
+	\ which fails, then OSBYTE 111) - but as I have no way to test the
+	\ Aries/Watford case, I'm going to stick with this probably-correct
+	\ code and not complicate things further.
+	{
+	    ldy #host_flags_offset:lda (oswrch_ww),y
+	    assert host_flag_shadow_mode == 1<<7
+	    tax \ save flag for later when we page video RAM out
+	    bpl not_shadow
+	    ldx #1:lda #108:jsr osbyte \ attempt to select Master/Integra-B video RAM
+	    inx:bne vram_select_ok     \ X<>255 => selected OK
+	    ldx #0:lda #111:jsr osbyte \ attempt to select Aries/Watford video RAM
+	.vram_select_ok
+	    ldx #host_flag_shadow_mode \ flag for later when we page video RAM out
+	.not_shadow
+	}
+
+	\ Copy the character into video RAM using an unrolled loop.
+	ldy #7
+	for i, 7, 0, -1
+	    lda (oswrch_v),y:sta (oswrch_u),y
+	    if i > 0
+		dey
+	    endif
+	next
+
+	\ Page in main RAM
+	{
+	    txa \ get saved flag from when we paged video RAM in
+	    bpl not_shadow
+	    lda #108:ldx #0:jsr osbyte \ attempt to page out Master/Integra-B video RAM
+	    inx:bne vram_select_ok     \ X<>255 => selected OK
+	    lda #111:ldx #1:jsr osbyte \ attempt to page out Aries/Watford video RAM
+	.vram_select_ok
+	.not_shadow
+	}
+    }
+
+.fast_path_done
+    pla:tay:pla:tax:pla
+
+    \ oswrch_tl still contains the value it had on entry, so we don't need to
+    \ restore it.
+    if debug
+    {
+        cmp oswrch_tl:beq ok:cant_happen:.ok
+    }
+    endif
+
+    jmp oswrch_shim_ram_return_from_rom_handler
+}
+
+
+\ Master OSWRCH handler
+
+{
+.not_fast_path
+    \ We must page ANDY out; the OSWRCH shim paged it in for us but that's only
+    \ useful on the fast path.
+    page_out_andy
+
+    jmp our_oswrch_common_init_done
+
+\ OSWRCH handler for Master. This is entered via the OSWRCH shim so the
+\ entry/exit conditions aren't the same as standard OSWRCH.
+\
+\ On entry:
+\   oswrch_tl contains the A supplied by the OSWRCH caller
+\   X and Y are those supplied by the OSWRCH caller
+\   oswrch_ww+1 has been initialised to point to our workspace; oswrch_ww has
+\   not so this code must initialise it to 0
+\   ANDY has been paged in
+\
+\ On exit:
+\   See our_oswrch_common_init_done
+.*our_oswrch_master
+    \ We can take advantage of the CMOS instructions in this Master-only code.
+    cpu 1
+
+    \ We don't explicitly page in the high workspace instead of the VDU
+    \ driver code, in case we're using high workspace and it isn't paged in;
+    \ in practice it seems to be reliably paged in already.
+
+    stz oswrch_ww
+    
+    lda oswrch_tl
+
+    if debug
+        sta debug_oswrch_a
+    endif
+
+    pha:phx:phy
+
+    our_oswrch_fast_path_common
+
+    \ Write the character to the video RAM.
+    {
+	\ U contains the address to write to
+
+	\ Get the address of the character bitmap in ANDY in V (ANDY has
+	\ already been paged in by the OSWRCH shim); see
+        \ init_oswrch_v_to_read_only_os_bitmap for a more commented version of
+        \ this code.
+	txa \ get character in A
+	asl a:asl a:asl a:sta oswrch_vl \ offset within page
+	txa \ get character in A
+	lsr a:lsr a:lsr a:lsr a:lsr a
+	assert (hi(andy_bitmaps_base_0) and %00000111) == 0
+	ora #hi(andy_bitmaps_base_0):sta oswrch_vh
+
+	\ Page in video RAM
+	{
+	    lda vdu_status:and #vdu_status_master_shadow_mode
+            tax \ save flag for later when we page video RAM out
+            beq not_shadow
+	    lda #acccon_master_shadow_ram_in_main_memory:tsb acccon
+	.not_shadow
+	}
+
+	\ Copy the character into video RAM using an unrolled loop.
+	ldy #7
+	for i, 7, 1, -1
+	    lda (oswrch_v),y:sta (oswrch_u),y
+	    if i > 1
+		dey
+	    endif
+	next
+	lda (oswrch_v):sta (oswrch_u)
+
+	\ Page in main RAM
+	{
+            txa \ get saved flag from when we paged video RAM in
+            beq not_shadow
+	    lda #acccon_master_shadow_ram_in_main_memory:trb acccon
+	.not_shadow
+	}
+
+	page_out_andy
+    }
+
+.fast_path_done
+    ply:plx:pla
+
+    \ oswrch_tl still contains the value it had on entry, so we don't need to
+    \ restore it.
+    if debug
+    {
+        cmp oswrch_tl:beq ok:cant_happen:.ok
+    }
+    endif
+
+    jmp oswrch_shim_ram_return_from_rom_handler
+
+    cpu 0
+}
+
+
+\ OSWRCH handler for the non-fast-path case; in principle this could be used for
+\ the fast-path case too, it would just be slower. This code is used on all
+\ machines.
+\
+\ On entry:
+\   A, X, Y from OSWRCH entry have been stacked
+\   A, X, Y have arbitrary values; the original A must be peeked from the stack
+\   W points to private workspace
+\
+\ On exit:
+\   A corrupted
+\   oswrch_tl should contain the A supplied by the OSWRCH caller
+\   X, Y should be those supplied by the OSWRCH caller
+\
+\ Exit is *not* via RTS but by a JMP to oswrch_shim_ram_return_from_rom_handler
+.our_oswrch_common_init_done
+    \ We JSR into the real implementation here; this is useful because there
+    \ are many disparate code paths and this means they can all conveniently
+    \ use RTS to get back to the clean-up-and-return-to-OSWRCH-caller fragment
+    \ immediately following the JSR.
+    jsr our_oswrch_common_body
+    \ TODO: If we can simplify the following code, we may be able to make the
+    \ fast path code do "JSR our_oswrch_common_body:JMP fast_path_done" instead
+    \ of "JMP our_oswrch_common_init_done"; this would save a few bytes.
+    \ Currently it's too different from fast_path_done to be a saving. (See the
+    \ comment at oswrch_shim_rom about not using oswrch_tl to communicate A
+    \ between the shim and the ROM.)
+    pla:tay:pla:tax:pla
+    sta oswrch_tl
+    jmp oswrch_shim_ram_return_from_rom_handler
+
+.our_oswrch_common_body
+    if debug
+	lda #42:ldx #42:ldy #42
+    endif
+
+    \ If *SPOOL is enabled, send the byte to the *SPOOL file. Our use of
+    \ parent_oswrch_unspooled to send bytes through to the OS driver will
+    \ ensure we don't double up any bytes.
+    ldy spool_file_handle:beq not_spooling
+    tsx:lda stack+5,x \ peek the character being processed off the stack
+    jsr osbput
+.not_spooling
+
+    \ If the VDU driver is in the middle of a multi-byte command, just
+    \ pass the byte through.
+    lda vdu_queue_size:bne oswrch_pass_through_in_vdu_sequence_indirect
+
+    \ Check the canaries in a debug build so we notice if we're
+    \ off-by-one with our checks for buffers being full.
+    if debug
+    {
+        ldy #pending_escape_canary_offset:lda (oswrch_ww),y
+        cmp #canary_value:beq ok1:cant_happen:.ok1
+        ldy #input_buffer_canary_offset:lda (oswrch_ww),y
+        cmp #canary_value:beq ok2:cant_happen:.ok2
+    }
+    endif
+
+    \ If the emulation is disabled, we observe control codes so we know what's
+    \ going on (and when to re-enable the emulation) but otherwise pass them
+    \ through to the VDU driver.
+    ldy #emulation_disabled_offset:lda (oswrch_ww),y
+    bne oswrch_pass_through_possibly_control_indirect
+
+    \ If we are part-way through processing an escape (or control)
+    \ sequence, use the state machine to decide what to do.
+    ldy #escape_seq_len_offset:lda (oswrch_ww),y:bpl in_escape_indirect
+
+    fall_through_to process_immediate
+
+
+\ We're processing a character which has an immediate effect, i.e. it is not
+\ part of an escape or control sequence (although it may be an <ESC> which
+\ starts such a sequence).
+.*process_immediate
+{
+    \ Peek the character being processed off from the stack
+    tsx:lda stack+5,x
+    \ If it's a control character, hand it over to the relevant routine.
+    cmp #del:beq vt102_del
+    cmp #' ':bcs not_control_character
+    \ We could save a byte by splitting control_character_jump_table into
+    \ separate low and high byte tables, then we could avoid the ASL A,
+    \ but it's just not worth the loss of readability.
+    asl a:tax
+    \ Transfer control using RTS
+    lda control_character_jump_table  ,x:pha
+    lda control_character_jump_table+1,x:pha
+.^process_immediate_rts
+    rts \ transfer control to the address we just pushed
+}
+
+
+.in_escape_indirect
+    jmp in_escape
+
+.oswrch_pass_through_in_vdu_sequence_indirect
+    jmp oswrch_pass_through_in_vdu_sequence
+
+.oswrch_pass_through_possibly_control_indirect
+    jmp oswrch_pass_through_possibly_control
+
+
+.vt102_del
+{
+    xassert_oswrch_ww_valid
+
+    \ A real VT102 does nothing if asked to output 127 (DEL), but the Acorn
+    \ OS VDU drivers perform a destructive backspace for this code. We
+    \ support both behaviours based on the user_option_ignore_del flag; the
+    \ ability to have the Acorn-style behaviour makes use of the normal BASIC
+    \ command line much more tolerable with the emulation on. I expect that
+    \ most VT102-using programs simply won't output 127 in the first place,
+    \ so the Acorn behaviour is probably acceptable in general.
+    ldy #user_options_offset:lda (oswrch_ww),y
+    and #user_option_ignore_del:bne process_immediate_rts
+
+    \ Since this is non-standard functionality, we get to define how it works.
+    \ The space written to the screen uses the current character attributes; we
+    \ don't try to preserve the previous character attributes of that cell. The
+    \ auto-wrap pending flag is cleared (this happens inside
+    \ set_both_cursors...). We ignore insert mode, so backspacing in insert
+    \ mode won't close up the gap.
+
+    \ Determine the desired logical cursor X position, allowing for a) auto
+    \ wrap, where the current logical X position is 79 on a single-width line,
+    \ but is conceptually 80 and b) the need to reverse index and wrap from
+    \ left margin to right margin if we're currently at the start of the line.
+    \ Note also that where we reverse index the two lines may have different
+    \ character widths, so we must call get_current_line_len after
+    \ reverse_index_subroutine.
+    ldy #fast_path_flags_offset:lda (oswrch_ww),y
+    assert fast_path_auto_wrap_pending == 1<<7
+    bmi auto_wrap_pending
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:bne not_at_start_of_line
+    jsr reverse_index_subroutine
+.auto_wrap_pending
+    jsr get_current_line_len
+.not_at_start_of_line
+    \ A now contains the desired logical cursor X position plus 1
+    sec:sbc #1
+    ldy #vt102_logical_cursor_x_offset:sta (oswrch_ww),y:pha
+
+    ldy #current_character_attributes_offset:lda (oswrch_ww),y:pha:tax
+    ldy #user_options_offset:lda (oswrch_ww),y
+    assert user_option_stored_screen == 1<<7
+    bpl no_stored_screen
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:tay
+    lda #' '
+    jsr set_stored_character
+.no_stored_screen
+
+    pla:tax \ get stacked current character attributes
+    jsr get_current_line_attributes:tay
+    lda #' '
+    jsr print_character
+
+    \ print_character advances vt102_logical_cursor_x by 1, so we need to undo
+    \ that.
+    pla:ldy #vt102_logical_cursor_x_offset:sta (oswrch_ww),y
+
+    jmp set_both_cursors_to_current_logical_x_y
+}
+
+
+\ Handle VT102 cancel (24 &18 030 CAN or 26 &1A 032 SUB)
+.*vt102_cancel
+    \ Cancel the current escape sequence
+    jsr finish_escape
+    
+    \ Output the substitute character; encode_character will encode any control
+    \ character as the substitute character. It's possible our behaviour here
+    \ isn't totally VT102-compatible - we treat this exactly like any other
+    \ character, so we respect auto-wrap and insert mode and so forth - but I
+    \ don't see any point in going crazy about this, it's not as if we'd expect
+    \ programs to routinely spam the screen with this noise deliberately.
+    fall_through_to not_control_character
+
+
+\ Part of the main OSWRCH handler; we've decided the character is printable
+\ so we're going to output it.
+\
+\ On entry:
+\   oswrch_ww is initialised
+\
+\   stack has A, X, Y, return-address so we can peek the character to process at
+\   the fifth byte on the stack.
+.not_control_character
+{
+    current_line_len_minus_one = oswrch_vl
+    encoded_character = oswrch_vh
+
+    \ We need to check for auto-wrap before we handle insert mode, because
+    \ if auto-wrap causes us to move on to the next line we will insert
+    \ there instead.
+    ldy #fast_path_flags_offset:lda (oswrch_ww),y
+    assert fast_path_auto_wrap_pending == 1<<7
+    bpl no_auto_wrap_pending
+    \ We need to auto-wrap, so move to the next line; this may cause
+    \ scrolling and will leave the Acorn and VT102 cursors in the correct
+    \ place.
+    jsr next_line
+.no_auto_wrap_pending
+
+    \ If we're in insert mode, create a space for the character we're about
+    \ to print.
+    xassert_oswrch_ww_valid
+    ldy #fast_path_flags_offset:lda (oswrch_ww),y
+    assert fast_path_insert_mode == 1
+    and #fast_path_insert_mode:beq not_in_insert_mode
+    jsr insert_a_characters
+.not_in_insert_mode
+
+    \ Encode the character; this takes account of the current character set
+    \ pointer and generates an 8-bit internal code which unambiguously represents
+    \ the symbol we want to display.
+    xassert_oswrch_ww_valid
+    ldy #current_character_set_pointer_offset:lda (oswrch_ww),y
+    tay
+    tsx:lda stack+5,x \ peek character from stack
+    jsr encode_character
+    sta encoded_character
+
+    \ Write the character to the stored screen. We do this before writing
+    \ to the video RAM as this corrupts less of our zp workspace; in
+    \ particular, it won't corrupt encoded_character.
+    {
+	xassert_oswrch_ww_valid
+	ldy #user_options_offset:lda (oswrch_ww),y
+        assert user_option_stored_screen == 1<<7
+        bpl no_stored_screen
+	ldy #current_character_attributes_offset:lda (oswrch_ww),y:tax
+        ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:tay
+	lda encoded_character
+	jsr set_stored_character
+    .no_stored_screen
+    }
+
+    \ We're almost ready to write the character to the video RAM, but we
+    \ need to decide if we're on the last character of the line before
+    \ vt102_logical_cursor_x is updated by print_character - if we are
+    \ there's special handling of the Acorn cursor and we need to set the
+    \ auto-wrap pending flag.
+    jsr get_current_line_len
+    tax:dex:stx current_line_len_minus_one
+    xassert_oswrch_ww_valid
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y
+    \ Set C iff logical_cursor_x >= current_line_len_minus_one; we don't
+    \ expect the greater than case to occur, but let's be paranoid.
+    cmp current_line_len_minus_one 
+    php \ save that C flag for later
+
+    \ OK, we're finally ready to call print_character to write the character
+    \ to the video RAM.
+    ldy #current_character_attributes_offset:lda (oswrch_ww),y:tax
+    jsr get_current_line_attributes:tay
+    lda encoded_character
+    \ print_character will corrupt all zero page workspace except oswrch_ww;
+    \ this is why we have some things saved on the stack. This advances the
+    \ VT102 cursor if appropriate.
+    jsr print_character
+
+    \ This will move the hardware cursor, which we might move immediately
+    \ afterwards if we reach at_end_of_line_auto_wrap, but this isn't a big
+    \ deal; it's probably too fast to see, and the intermediate cursor position
+    \ is "sensible" if the user happens to see it.
+    jsr set_both_cursors_to_current_logical_x_y
+
+    \ If we had temporarily selected G2 or G3, revert to the previous character
+    \ set pointer.
+    xassert_oswrch_ww_valid
+    ldy #fast_path_flags_offset:lda (oswrch_ww),y
+    assert fast_path_temporary_character_set_pointer == 1<<6
+    asl a:bpl no_temporary_character_set_pointer
+    lda (oswrch_ww),y:xand_not fast_path_temporary_character_set_pointer:sta (oswrch_ww),y
+    ldy #pending_character_set_pointer_offset:lda (oswrch_ww),y
+    assert pending_character_set_pointer_offset - 1 == current_character_set_pointer_offset
+    dey:sta (oswrch_ww),y
+    jsr update_fast_path_flags
+.no_temporary_character_set_pointer
+
+    \ We're nearly done. What remains to do depends whether we just output a
+    \ character at the last position on the line or not.
+    plp \ get saved C flag
+    bcc not_at_end_of_line
+    \ We just output at the last position on the line.
+    \ If auto wrap mode is not enabled, there's nothing special to do.
+    ldy #vt102_flags_offset:lda (oswrch_ww),y
+    and #vt102_flag_auto_wrap_mode:bne at_end_of_line_auto_wrap
+.not_at_end_of_line
+
+.^not_control_character_rts
+    rts
+
+.at_end_of_line_auto_wrap
+    \ Set the auto-wrap pending flag.
+    ldy #fast_path_flags_offset:lda (oswrch_ww),y
+    ora #fast_path_auto_wrap_pending:sta (oswrch_ww),y
+
+    \ We always leave the VT102 cursor where it is - this is essential
+    \ for correct behaviour. However, unless we're on the last line of the
+    \ scrolling region, we move the hardware cursor to the start of the next
+    \ line, to show where the next character output will appear. We don't
+    \ want to do this if we are on the last line of the scrolling region as
+    \ we'd be lying about where the next character would appear. (Arguably
+    \ we're lying anyway, since it won't appear at the bottom right cursor
+    \ position either. But this seems to be a) a conventional lie b) a lie
+    \ we can tell consistently - we can't always physically position the
+    \ cursor on the line below the bottom of the scrolling region, if the
+    \ scrolling region goes right to the bottom of the physical Acorn screen.)
+    \
+    \ TODO: I like this behaviour because it seems consistent with the standard
+    \ Acorn cursor behaviour and probably isn't going to confuse anyone, but
+    \ it might be good to offer a user option to follow what (I assume) to be
+    \ the standard VT102 behaviour and show the Acorn cursor exactly where
+    \ the VT102 cursor logically is. A quick experiment with the 'vt102'
+    \ emulator suggests my assumption is correct; try:
+    \   A=0123456789; echo -n $A$A$A$A$A$A$A$A; sleep 10
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y
+    ldy #bottom_margin_offset:cmp (oswrch_ww),y
+    bcs not_control_character_rts \ bcs not beq just for paranoia
+    ldx #0
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:tay:iny
+    jmp set_hardware_cursor_position_logical_x_y_no_bounds_checking
+}
+
+
+\ Call the parent OSWRCH, temporarily setting spool_file_handle to 0 so it won't
+\ write to the *SPOOL file (if any). The idea here is that our OSWRCH will
+\ already have written to this, so we don't want any duplication if we are
+\ forwarding on to the parent OSWRCH - and if we are making "internal" calls to
+\ the parent OSWRCH, those should not be written to the *SPOOL file either.
+.*parent_oswrch_unspooled
+{
+    pha:txa:pha
+    lda spool_file_handle:pha
+    lda #0:sta spool_file_handle
+    tsx:lda stack+3,x \ get the original A
+    jsr parent_oswrch
+    pla:sta spool_file_handle
+    pla:tax:pla
+    rts
+}
+
+
+\ The Acorn cursor has been moved outside our control.
+.cursor_moved
+{
+    xassert_oswrch_ww_valid
+    ldy #emulation_disabled_offset:lda (oswrch_ww),y
+    bne not_control_character_rts
+    jmp acorn_to_vt102_cursor
+}
+
+
+\ The emulation is disabled, so we're going to pass the current character
+\ through to the OS VDU driver. If it's a control character we will record it
+\ and possibly trigger some corresponding actions.
+\
+\ On entry:
+\   A, X, Y have arbitrary values; the original A must be peeked from the stack
+.oswrch_pass_through_possibly_control
+    tsx:lda stack+5,x \ peek character being processed from stack
+    cmp #' ':bcs parent_oswrch_unspooled
+    fall_through_to acorn_control_character
+
+
+\ We've seen a control character which is going to be treated as an Acorn
+\ control character; *the emulation may or may not be enabled*.
+.acorn_control_character
+{
+    xassert_oswrch_ww_valid
+    \ If the emulation is enabled and we're ignoring unsupported (by a VT102)
+    \ control characters, just ignore this character.
+    ldy #user_options_offset:lda (oswrch_ww),y
+    and #user_option_ignore_unsupported:beq dont_ignore
+    ldy #emulation_disabled_offset:lda (oswrch_ww),y:bne dont_ignore
+    rts
+.dont_ignore
+    \ Alternate entry point (used only for BEL) for control codes which we
+    \ always want to pass through to the OS handler even if we are ignoring
+    \ codes which aren't meaningful for a VT102.
+.^common_control_character
+    xassert_oswrch_ww_valid
+    \ Record what this control character was; when the next Acorn VDU
+    \ sequence completes, we will refer back to it so we can detect things
+    \ like mode changes.
+    tsx:lda stack+5,x \ peek character being processed from stack
+    ldy #last_acorn_control_character_offset:sta (oswrch_ww),y
+    fall_through_to oswrch_pass_through_in_vdu_sequence
+}
+
+
+\ Pass the current character through to the OS VDU driver; it's either
+\ a control character or it forms part of a multi-byte VDU sequence. If
+\ it completes a VDU sequence take any appropriate actions; *this code is
+\ called when the emulation is enabled or disabled so that must be taken
+\ into account*.
+\
+\ On entry:
+\   A, X, Y have arbitrary values; the original A must be peeked from the stack
+\
+\ On exit:
+\   all zp workspace except W is corrupted
+.oswrch_pass_through_in_vdu_sequence
+{
+    \ Pass the character to the OS VDU driver.
+    tsx:lda stack+5,x \ peek character being processed from stack
+    jsr parent_oswrch_unspooled
+
+    \ Are we part-way through a VDU sequence now this character has been
+    \ processed?
+    lda vdu_queue_size:bne oswrch_pass_through_in_vdu_sequence_rts
+    \ No. We either just finished a VDU sequence or we just output a
+    \ control character which, since we're here, was a single byte one.
+    \ Either way, was it interesting? Bear in mind that this code executes
+    \ both when we are enabled and when we are disabled. (We continue to examine 
+    \ Acorn control characters when we're disabled since the processing of them
+    \ may trigger us to re-enable ourselves.)
+    jsr init_oswrch_ww_vectors_claimed
+    ldy #last_acorn_control_character_offset:lda (oswrch_ww),y
+    \ We check for enable/disable screen drivers always (if we just disabled we
+    \ need to act accordingly, and the enable code is not ignored by the OS when
+    \ the drivers are disabled), but other codes don't have effect if the VDU
+    \ drivers are disabled.
+    cmp #vdu_enable_screen_drivers:beq enable_screen_drivers
+    cmp #vdu_disable_screen_drivers:beq disable_screen_drivers
+    assert vdu_status_screen_disabled == 1<<7
+    ldx vdu_status:bmi oswrch_pass_through_in_vdu_sequence_rts
+    cmp #vdu_text_at_text:beq text_at_text
+    cmp #vdu_text_at_graphics:beq text_at_graphics
+    cmp #vdu_set_mode:beq mode_changed_subroutine_indirect
+    cmp #vdu_set_text_window:beq text_window_set
+    cmp #vdu_reset_text_window:beq text_window_reset
+    cmp #vdu_home_upper_left:beq cursor_moved
+    cmp #vdu_move_cursor:beq cursor_moved
+.^oswrch_pass_through_in_vdu_sequence_rts 
+    rts
+}
+
+\ The Acorn screen mode has changed.
+.mode_changed_subroutine_indirect
+    jmp mode_changed_subroutine
+
+\ Seen VDU code specifying text is written at the text cursor (the default setting)
+.text_at_text
+    ldx #emulation_disabled_text_at_graphics
+    xbne_always undo_emulation_temporarily_disabled
+
+\ Seen VDU code specifying text is written at the graphics cursor
+.text_at_graphics
+    ldx #emulation_disabled_text_at_graphics
+    xbne_always emulation_temporarily_disabled
+
+\ Seen VDU code enabling the screen drivers
+.enable_screen_drivers
+    ldx #emulation_disabled_screen_disabled
+    xbne_always undo_emulation_temporarily_disabled
+
+\ Seen VDU code disabling the screen drivers
+.disable_screen_drivers
+    ldx #emulation_disabled_screen_disabled
+    xbne_always emulation_temporarily_disabled
+
+\ Seen VDU code resetting (clearing) the text window
+.text_window_reset
+    ldx #emulation_disabled_text_window_set
+    fall_through_to undo_emulation_temporarily_disabled
+
+\ We've processed an Acorn VDU sequence which might stop us being temporarily
+\ disabled (if there's no other reason we're temporarily disabled). Record this
+\ and if we are no longer temporarily disabled, pick up control from the OS VDU
+\ driver.
+\
+\ On entry, X identifies the reason for temporarily being disabled which no
+\ longer applies.
+.undo_emulation_temporarily_disabled
+{
+    xassert_oswrch_ww_valid
+    ldy #emulation_disabled_offset
+    txa:eor #&ff
+    and (oswrch_ww),y
+    sta (oswrch_ww),y
+    bne still_disabled
+    \ We're no longer disabled. Revert the cursor to its previous position (and
+    \ size); we do this instead of picking up the Acorn cursor position and
+    \ using it as the VT102 cursor position since a "temporary" escape into
+    \ Acorn mode should be as unintrusive as possible to the running application.
+    jsr set_both_cursors_to_current_logical_x_y
+.still_disabled
+    jmp update_fast_path_flags
+}
+
+\ Seen OS code setting a text window
+.text_window_set
+    ldx #emulation_disabled_text_window_set
+    fall_through_to emulation_temporarily_disabled
+
+\ We've processed an Acorn VDU sequence which has caused the emulation to
+\ enter a temporarily disabled state. (We may already have been temporarily
+\ disabled for another reason anyway.) Record this and put things back
+\ to normal for the benefit of the OS VDU driver. This provides a way for
+\ a program which knows it's running under this emulation to temporarily
+\ "escape" back into Acorn mode; the other reason we have the concept of
+\ being temporarily disabled is that there's no clear interaction between
+\ some of these features and VT102 mode. (For example, an Acorn text window
+\ doesn't map onto a VT102 scrolling region as the former can have X edges
+\ which aren't the screen edges.)
+\
+\ On entry, X identifies the reason we're temporarily disabled.
+.emulation_temporarily_disabled
+    xassert_oswrch_ww_valid
+    ldy #emulation_disabled_offset:lda (oswrch_ww),y
+    assert emulation_disabled_unsupported_mode == 1<<0
+    lsr a:bcs oswrch_pass_through_in_vdu_sequence_rts
+
+    txa:ora (oswrch_ww),y:sta (oswrch_ww),y
+    jsr update_fast_path_flags
+
+    fall_through_to vt102_to_acorn_cursor
+
+
+\ Make a best-effort attempt to move the OS cursor to the same physical position
+\ on the screen as the current VT102 cursor location; this isn't always possible
+\ due to text windows. The cursor is also set to standard width, since there's
+\ no such thing as a double-width line as far as the OS is concerned.
+\
+\ The caller should ensure the emulation is not disabled before calling this.
+.*vt102_to_acorn_cursor
+{
+    \ We might currently be on a double-width line and thus be using a
+    \ double-width cursor, but when we're disabled in a supported mode the
+    \ line attributes have no effect, so we want a normal cursor. Note that
+    \ we can only do this if we're in a supported mode, since otherwise
+    \ we'll write an incorrect value to the video ULA control register; this
+    \ is one reason this must not be called if the emulation is disabled.
+    jsr set_normal_cursor_width
+
+    \ We've been fiddling around with the CRTC cursor ourselves. To give the
+    \ OS a chance to set everything up consistently, we deliberately move
+    \ the Acorn cursor to the position corresponding to the VT102 cursor
+    \ position, if we can, otherwise to the Acorn home position.
+    \
+    \ TODO: This will have no effect if we've just passed through a VDU 21,
+    \ which isn't a big deal but is a little annoying. We could simply never
+    \ pass through VDU 21 and VDU 6 at all, but for now let's give the user
+    \ the option.
+    \
+    \ We determine the Acorn X and Y co-ordinates before making any parent OSWRCH 
+    \ calls as otherwise oswrch_ww would be corrupted.
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:tay
+    cmp vdu_text_window_top_row:bcc cursor_outside_text_window
+    cmp vdu_text_window_bottom_row
+    { beq ok:bcs cursor_outside_text_window:.ok }
+    sec:sbc vdu_text_window_top_row:tax \ save Acorn Y co-ordinate
+    lda (oswrch_ww),y:php \ save line attributes
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y
+    { plp:beq not_double_width:asl a:.not_double_width }
+    cmp vdu_text_window_left_column:bcc cursor_outside_text_window
+    cmp vdu_text_window_right_column
+    { beq ok:bcs cursor_outside_text_window:.ok }
+    sec:sbc vdu_text_window_left_column:pha \ save Acorn X co-ordinate
+    lda #vdu_move_cursor:jsr parent_oswrch_unspooled
+    pla:jsr parent_oswrch_unspooled
+    txa
+.common
+    jsr parent_oswrch_unspooled
+    jmp init_oswrch_ww_vectors_claimed
+.cursor_outside_text_window
+    lda #vdu_home_upper_left:xbne_always common
+}
+
+
+\ Encode the character in A using the character set pointer in Y as an
+\ internal 8-bit character suitable for passing to print_character, returning
+\ that character in A.
+\
+\ A note on terminology: the term "pound" is used exclusively to refer to the
+\ UK pound sterling currency symbol. It never means "#", which is referred to
+\ as "hash".
+\
+\ The encoded value is:
+\ 0 - unused
+\ 1-31 - the non-blank special graphics characters
+\   - in the same order as in the VT102 codes, except that 30 is used
+\     to represent backtick not pound 
+\ 32 - ASCII space/blank special graphics character
+\ 33-126 - Acorn ASCII (including pound as 96; otherwise same as VT102 US ASCII)
+\ 127 - unused
+\ 128-255 - Acorn ASCII (i.e. user-defined characters)
+\
+\ The advantage of encoding pound and backtick in this way is that the normal
+\ Acorn pound bitmap is located based on its code just like any other regular
+\ character, while similarly the non-(Acorn)-standard backtick bitmap is located
+\ within all the other non-(Acorn)-standard special graphics bitmaps.
+\
+\ TODO: If I ever want to support the real VT52 graphics characters instead of
+\ using the VT102 graphics characters even in VT52 mode, I *may* want to assign
+\ internal character codes to them - but it may well be best to just interpret
+\ codes 1-31 as one set of graphics characters or the other depending on the
+\ mode. (We could continue to encode pound as 30; there are 30 VT52 graphics
+\ characters, so we could use 1-29 and 31 to encode these.) It would perhaps
+\ be a shame to remove the availability of the full range of Acorn user-defined
+\ characters 128-255 by repurposing some of these codes.
+.encode_character
+{
+    \ Range of special character codes within the special character set
+    vt102_first_special_character_code = 95
+    vt102_last_special_character_code = 126
+
+    \ VT102 code for the pound symbol in the special character set
+    vt102_special_set_pound_code = vt102_first_special_character_code + 30
+
+    \ Internal codes used to represent pound, backtick and chequerboard.
+    internal_pound_code = 96 \ the same as in standard Acorn ASCII
+    internal_backtick_code = 30 \ in our special graphics character range
+    internal_chequerboard_code = 2 \ in our special graphics character range
+
+    \ TODO: Note that we treat both the alternate and alternate special character
+    \ sets as "ordinary"; this means they both end up being duplicates of 
+    \ the US character set. I think this is OK; it seems to be what xterm does
+    \ and on a real VT102 you would need a presumably fairly rare alternate
+    \ character ROM to have these do anything interesting. There are some
+    \ possibilities for handling this, but I'm postponing the decision until a
+    \ potential use case turns up:
+    \
+    \ - We could output a well-defined range of Acorn user-defined characters as
+    \   the alternate characters. This is flexible, but it would mean that if
+    \   the user hasn't defined these the output would be a bit unpredictable.
+    \   If we're using a wide range of Acorn user-defined characters
+    \   (potentially there's way more than 32) we would sort of be assuming the
+    \   font is exploded, which is likely to be true but possibly there will be
+    \   cases where the user prefers to avoid this.
+    \
+    \ - We could have alternate characters stored in the ROM, perhaps at a
+    \   documented location so a user can patch the ROM.
+    \
+    \ - As a hybrid of the former two, we could output Acorn user-defined
+    \   characters but provide a * command which defines them in a "standard"
+    \   way.
+    \
+    \ Similar considerations might apply to the graphics characters in VT52
+    \ mode; a real VT102 uses its own characters, but we may optionally wish to
+    \ output true VT52 graphics characters via some mechanism like the above.
+    xassert_oswrch_ww_valid
+    
+    \ Set Y to the character set ID; it starts off as the character set pointer.
+    pha
+    tya:clc:adc #character_set_pointers_offset:tay
+    lda (oswrch_ww),y:tay
+    pla
+
+    cpy #character_set_special:bne ordinary_character
+    cmp #vt102_first_special_character_code:bcc ordinary_character
+    cmp #(vt102_last_special_character_code+1):bcc special_character
+    fall_through_to ordinary_character
+
+.ordinary_character
+    \ Y contains the character set ID
+    cmp #vt102_uk_set_pound_code:bne not_pound
+    cpy #character_set_uk:beq pound
+.not_pound
+    cmp #vt102_backtick_code
+    bne not_backtick
+    \ We've seen vt102_backtick_code (96) and we're in the US character
+    \ set; if we're using the real DEC US character set we encode this
+    \ internal_backtick_code, otherwise we're using "Acorn US" and we encode
+    \ it as internal_pound_code (96).
+    ldy #user_options_offset:lda (oswrch_ww),Y:and #user_option_dec_us
+    bne backtick
+.pound
+    lda #internal_pound_code
+    rts
+.backtick
+    lda #internal_backtick_code
+    rts
+.not_backtick
+    \ We must turn control characters into the substitute character;
+    \ vt102_cancel relies on this. (It can't easily do this substitution itself,
+    \ as it would have to fiddle with the stacked A, but then that would be
+    \ returned to the caller and OSWRCH must leave A unmodified.)
+    cmp #internal_encoding_first_non_special_character:bcc control_character
+    rts
+.control_character
+    lda #internal_chequerboard_code
+    rts
+
+.special_character
+    cmp #vt102_special_set_pound_code:beq pound
+    sec:sbc #vt102_first_special_character_code
+    bne not_blank
+    lda #' '
+.not_blank
+.*rts_for_set_v_clear_n_corrupt_z
+    rts
+
+}
+
+
+\ Set oswrch_ww to point to the start of the ROM's workspace. This works whether
+\ or not ANDY is paged in; most of the time we can be sure ANDY isn't paged in,
+\ but I don't think this is performance critical so we just keep it simple here.
+\
+\ A, X and Y are all corrupted
+.*init_oswrch_ww_corrupt_axy
+    init_workspace_ptr oswrch_ww
+    if debug
+        lda #42:ldx #42:ldy #42:clv:clc
+    endif
+    rts
+
+\ As init_oswrch_ww_corrupt_axy, but doesn't corrupt anything except A (and the
+\ N and Z flags) and can only be used when vectors are claimed.
+\
+\ Preserves: X, Y
+.*init_oswrch_ww_vectors_claimed
+    xassert_vectors_claimed
+    lda oswrch_shim_ram+oswrch_shim_lda_workspace_high_offset+1:sta oswrch_ww+1
+    lda #0:sta oswrch_ww
+    rts
+
+
+\ Call the parent OSWRCH, i.e. the one whose address we saved when we claimed
+\ vectors. Note that this will work equally well if the parent OSWRCH handler is
+\ using normal or extended vectors, since our code doesn't touch the extended
+\ vector for OSWRCH.
+\
+\ This corrupts all our zero page workspace as usual. Note that it *doesn't*
+\ need oswrch_ww to be initialised on entry - so it's safe to call this several
+\ times in a row - this is done to make it behave like regular OSWRCH in this
+\ respect.
+.*real_parent_oswrch
+{
+    assert oswrch_ww   != oswrch_zp and oswrch_ww   != oswrch_zp+1
+    assert oswrch_ww+1 != oswrch_zp and oswrch_ww+1 != oswrch_zp+1
+    sta oswrch_zp
+    sty oswrch_zp+1
+    xassert_vectors_claimed
+    jsr init_oswrch_ww_vectors_claimed
+    \ Transfer control to the parent WRCHV handler using RTI; we can't use the
+    \ "RTS trick" here as it's not convenient to subtract 1 from the address,
+    \ and this is shorter than storing the address and using JMP (abs), although
+    \ it does cost an extra four cycles.
+    ldy #old_wrchv_offset+1:lda (oswrch_ww),y:pha
+    dey:lda (oswrch_ww),y:pha
+    lda oswrch_zp
+    ldy oswrch_zp+1
+    php
+    rti
+}
+
+} \ close file scope

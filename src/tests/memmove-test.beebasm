@@ -1,0 +1,43 @@
+\ memmove-test.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Top level file for a standalone test of memmove.beebasm; used to gain
+\ confidence that it's correct in a range of cases, some manually chosen and
+\ some randomly generated. This is assembled using "beebasm -o" to generate a
+\ file containing the assembled code, rather than a disc image, and the result
+\ is included in stem.beebasm.
+
+include "macros.beebasm"
+
+oswrch_t=&70
+oswrch_tl=oswrch_t
+oswrch_th=oswrch_t+1
+oswrch_u=&74
+oswrch_ul=oswrch_u
+oswrch_uh=oswrch_u+1
+oswrch_v=&78
+oswrch_vl=oswrch_v
+oswrch_vh=oswrch_v+1
+oswrch_w=&7A
+stack=&100
+
+debug = TRUE
+alignment_assertions_enabled = FALSE
+
+\ This address is duplicated in stem.beebasm and memmove.bas; if it's changed in
+\ one place it must be changed in all three. (We could factor out the two
+\ .beebasm file uses into an include file, but that wouldn't help with
+\ memmove.bas.)
+org &7800
+guard &7c00
+
+.start
+jmp memmove
+include "memmove.beebasm"
+.end
+save start, end

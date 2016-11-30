@@ -1,0 +1,1108 @@
+\ bulk.beebasm
+
+\ This file is part of STEM. It is subject to the licence terms in the
+\ LICENCE.txt file found in the top-level directory of this distribution and
+\ at https://github.com/ZornsLemma/STEM. No part of STEM, including this file,
+\ may be copied, modified, propagated, or distributed except according to
+\ the terms contained in the LICENCE.txt file.
+
+\ Implementations of escape sequences which involve bulk manipulation of the
+\ emulated terminal display, such as insert/delete line, and related utility
+\ routines. The performance-critical memory manipulation itself is handled
+\ by memset and memmove.
+
+\ Some of the subroutines in here were sketched out in C first and an attempt
+\ has been made to keep the two in sync; see pseudo.c.
+
+{ \ open file scope
+
+\ We've seen <ESC>[...K (EL)
+\ This does not alter line attributes but it does erase character attributes.
+.*erase_in_line
+{
+    jsr page_in_video_ram
+    xassert_oswrch_ww_valid
+    jsr get_raw_first_parameter_in_a:beq erase_in_line_to_end_of_line
+    tax
+    dex:beq erase_in_line_to_start_of_line \ branch if A=1
+    dex:bne page_in_main_ram_indirect \ branch if A!=2
+    fall_through_to erase_in_line_entire_line
+
+\ Erase the complete line
+.erase_in_line_entire_line
+    ldx #0      \ from (inclusive)
+    ldy #80     \ to (exclusive)
+    xbne_always erase_in_line_common
+
+\ We've seen <ESC>K (VT52 erase to end of line)
+.*vt52_erase_to_end_of_line
+    jsr page_in_video_ram
+    fall_through_to erase_in_line_to_end_of_line
+
+\ Erase from cursor position (inclusive) to end of line
+.erase_in_line_to_end_of_line
+    xassert_oswrch_ww_valid
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y
+    tax         \ from (inclusive)
+    ldy #80     \ to (exclusive)
+.erase_in_line_common
+    lda #0      \ character attributes
+    jsr erase_characters_within_line
+.page_in_main_ram_indirect
+    jmp page_in_main_ram
+
+\ Erase from start of line to cursor position (inclusive)
+.erase_in_line_to_start_of_line
+    xassert_oswrch_ww_valid
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y
+    tay:iny     \ to (exclusive)
+    ldx #0      \ from (inclusive)
+    xbeq_always erase_in_line_common
+}
+
+
+\ Common initialisation code factored out of insert_line and delete_line. It's
+\ entered as a subroutine and checks to see if the cursor is outside
+\ the scrolling region. If it is does a "double RTS" to return to the
+\ caller's caller, otherwise it pages in video RAM and returns with result
+\ get_constrained_first_parameter_in_a.
+.insert_delete_line_common_init
+{
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y
+    ldy #top_margin_offset:cmp (oswrch_ww),y:bcc outside_scrolling_region
+    assert top_margin_offset + 1 == bottom_margin_offset
+    iny:cmp (oswrch_ww),y
+    beq not_outside_scrolling_region
+    bcs outside_scrolling_region
+.not_outside_scrolling_region
+    jsr page_in_video_ram
+    jmp get_constrained_first_parameter_in_a \ A=lines to insert(>=1) ('count')
+.outside_scrolling_region
+    \ We're outside the scrolling region, so discard the return address stacked
+    \ by our caller and return to the caller's caller.
+    pla:pla
+.^insert_delete_line_common_init_rts
+    rts
+}
+
+
+\ We've seen <ESC>[...@ (ICH)
+\ This is an ANSI escape sequence not supported on a real VT102, but vttest
+\ contains a test for it and it seems both useful and easy to implement so
+\ we support it.
+.*insert_character
+    jsr get_constrained_first_parameter_in_a \ A=characters to insert (>=1)
+    fall_through_to insert_a_characters
+
+\ Insert A characters with the current character attributes at the current
+\ cursor position. (In insert mode the character attributes don't really
+\ matter, as the inserted space is always overwritten by a character using
+\ the current character attributes anyway - so this default is good for
+\ minimising display "flicker" but otherwise unimportant. When called via
+\ insert_character the character attributes do matter. A real VT102 doesn't
+\ suport this at all so there's no question of compatibility. The VT220 manual
+\ at http://vt100.net/docs/vt220-rm/chapter4.html#S4.11 says the inserted
+\ characters have normal character attributes; it's not clear to me if that
+\ means *no* character attributes or *current* character attributes. The same
+\ page says about DCH that the spaces created at the end of the line have all
+\ their character attributes off, which definitely isn't what the VT102 does
+\ (I've tested itn the the 'vt102' emulator), so either that manual is wrong
+\ or the VT220 differs from the VT102 in this area.)
+.*insert_a_characters
+{
+    pha \ call this 'count'
+
+    jsr page_in_video_ram
+
+    xassert_oswrch_ww_valid
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:sta oswrch_tl
+    pla:clc:adc oswrch_tl:pha:tay    \ to = logical_cursor_x + count
+    lda oswrch_tl:pha:tax            \ from = logical_cursor_x
+                                     \ stack: (top) from to
+    jsr copy_characters_within_line
+
+    xassert_oswrch_ww_valid
+    ldy #current_character_attributes_offset:lda (oswrch_ww),y
+    sta oswrch_tl
+    pla:tax                          \ from
+    pla:tay                          \ to
+    lda oswrch_tl                    \ character attributes
+    jsr erase_characters_within_line
+
+    jmp page_in_main_ram
+}
+
+
+\ We've seen <ESC>[...J (ED)
+.*erase_in_display
+{
+    \ Where we're partially erasing a line here, we don't erase the line
+    \ attributes on that line; this falls out naturally from the way we build up
+    \ the required erase from erase_lines_within_screen and
+    \ erase_characters_within_line.
+
+    xassert_oswrch_ww_valid
+    \ We don't need to check parameter_count; vt102_escape initialises the first
+    \ parameter to 0 anyway.
+    jsr get_raw_first_parameter_in_a:beq erase_to_end_of_screen
+    tax
+    dex:beq erase_to_start_of_screen \ branch if A=1
+    dex:bne insert_delete_line_common_init_rts \ branch if A!=2
+    fall_through_to erase_screen_subroutine
+
+.*erase_screen_subroutine
+    jsr page_in_video_ram
+    ldx #0                                                  \ from
+.^erase_within_screen_common_from_set
+    xassert_oswrch_ww_valid
+    ldy #emulated_screen_lines_offset:lda (oswrch_ww),y:tay \ to
+.^erase_within_screen_common_from_to_set
+    xassert_oswrch_ww_valid
+    sec                                                     \ stored+video RAM
+    jsr erase_lines_within_screen
+
+    \ We may have altered the current line attributes, so we need to update
+    \ the fast path flags and reposition the hardware cursor. (This isn't
+    \ necessary when entered via the erase_within_screen_common_* labels as
+    \ they never alter the current line attributes, but it's not wrong and
+    \ shouldn't significantly harm performance.)
+    jmp tidy_up
+}
+
+\ We've seen <ESC>J (VT52 erase to end of screen)
+.*vt52_erase_to_end_of_screen
+    fall_through_to erase_to_end_of_screen
+
+.erase_to_end_of_screen
+{
+    xassert_oswrch_ww_valid
+    jsr page_in_video_ram
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:tax \ from
+    ldy #80                                                  \ to
+    lda #0                                                   \ character attributes
+    jsr erase_characters_within_line
+
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:tax:inx     \ from
+    xbne_always erase_within_screen_common_from_set
+}
+
+.erase_to_start_of_screen
+{
+    xassert_oswrch_ww_valid
+    jsr page_in_video_ram
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:tay:iny \ to
+    ldx #0                                                       \ from
+    txa                                                          \ character attributes
+    jsr erase_characters_within_line
+
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:tay             \ to
+    ldx #0                                                       \ from
+    xbeq_always erase_within_screen_common_from_to_set
+}
+
+
+\ We've seen <ESC>[...L (IL)
+\
+\ TODO: It may or may not be useful in practice, but this can probably be
+\ optimised to use hardware scrolling (perhaps via index/reverse_index) if
+\ we're inserting on the top or bottom line of the screen and the scrolling
+\ region is the entire screen.
+.*insert_line
+{
+    jsr insert_delete_line_common_init
+
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:clc:adc (oswrch_ww),y:pha
+    lda (oswrch_ww),y:tax \ from = cursor_y
+    pla:pha:tay           \ to   = cursor_y + count
+    jsr copy_lines_within_margins
+
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:tax \ from = cursor_y
+    pla:tay                                          \ to = cursor_y + count
+.^erase_lines_within_margins_and_tidy_up
+    jsr erase_lines_within_margins
+.^tidy_up
+    jsr update_fast_path_flags
+    \ The line attributes might have changed, so we must update the cursor
+    \ position.
+    jsr set_both_cursors_to_current_logical_x_y
+.^page_in_main_ram_indirect
+    jmp page_in_main_ram
+}
+
+
+\ We've seen <ESC>[...M (DL)
+
+\ TODO: There might be a bug here; according to the VT102 manual at vt100.net
+\ (http://www.vt100.net/docs/vt102-ug/chapter5.html):
+\
+\ "Lines added to bottom of screen have spaces with same character attributes
+\ as last line moved up."
+\
+\ xterm doesn't do this, unless I've misunderstood and my test case isn't
+\ correct. Try this with the 'vt102' emulator. The implementation would probably
+\ be something along the lines of:
+\ - do the operation as now
+\ - afterwards (provided there's a stored screen, of course), iterate over the
+\   second to last line moved, ORing together the attributes bytes and copynig
+\   them into the corresponding bytes on the last line. (We'd do this directly,
+\   not going via get_stored_character/set_stored_character.)
+\ - If the OR-ed attribute byte (which would have a set of character attributes
+\   in each nybble) doesn't indicate reverse or underlined, we're done.
+\ - otherwise use redraw_line to redraw the bottom line with the new attributes
+\   we put there.
+.*delete_line
+{
+    jsr insert_delete_line_common_init
+
+    pha
+
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:clc:adc (oswrch_ww),y:tax \ from = cursor_y + count
+    lda (oswrch_ww),y:tay                                \ to = cursor_y
+    jsr copy_lines_within_margins
+
+    \ Set A = from = max(cursor_y, bottom_margin + 1 - count). That second
+    \ argument may be negative, so we must be careful.
+    xassert_oswrch_ww_valid
+    pla:sta oswrch_tl
+    ldy #bottom_margin_offset:lda (oswrch_ww),y
+    ldy #vt102_cursor_y_offset
+    dec oswrch_tl:sec:sbc oswrch_tl
+    bmi cursor_y_larger
+    \ OK, A is positive, so we can now compare as unsigned.
+    cmp (oswrch_ww),y
+    bcs cursor_y_smaller
+.cursor_y_larger
+    lda (oswrch_ww),y
+.cursor_y_smaller
+
+    tax                   \ from
+    ldy #max_screen_lines \ to
+    xbne_always erase_lines_within_margins_and_tidy_up
+}
+
+
+\ We've seen <ESC>[...P (DCH)
+.*delete_character
+{
+    count = oswrch_vl
+    line_len = oswrch_vh
+    logical_cursor_x = oswrch_uh
+
+    jsr page_in_video_ram
+
+    jsr get_constrained_first_parameter_in_a \ A=characters to delete (>=1)
+    sta count
+
+    jsr get_current_line_len
+    sta line_len
+
+    \ Get the character attributes of the last character on the line;
+    \ the gap opened up at the right hand end of the line has these
+    \ attributes. Note that in the case of reverse video and/or underline,
+    \ this means the gap opened up is not simply the background colour;
+    \ erase_characters_within_line handles this. (Behaviour verified with
+    \ 'vt102' emulator.)
+    xassert_oswrch_ww_valid
+    ldx #0 \ default to no attributes if there's no stored screen to check
+    ldy #user_options_offset:lda (oswrch_ww),y
+    assert user_option_stored_screen == 1<<7
+    bpl no_stored_screen
+    ldy line_len:dey
+    jsr get_stored_character \ A=character (unwanted), X=character attributes
+.no_stored_screen
+    txa:pha                 \ stack: (top) attributes
+
+    xassert_oswrch_ww_valid
+    \ Set A = erase_from = max(line_len - count, logical_cursor_x), taking care
+    \ to handle the case where the first argument is negative correctly.
+    ldy #vt102_logical_cursor_x_offset:lda (oswrch_ww),y:sta logical_cursor_x:tay
+    lda line_len:sec:sbc count
+    bmi line_len_minus_count_lt_logical_cursor_x
+    cmp logical_cursor_x:bcs line_len_minus_count_ge_logical_cursor_x
+.line_len_minus_count_lt_logical_cursor_x
+    lda logical_cursor_x
+.line_len_minus_count_ge_logical_cursor_x
+    pha                 \ stack: (top) erase_from attributes
+
+    \ copy_characters_within_line(from = logical_cursor_x + count, to =
+    \ logical_cursor_x)
+    tya:clc:adc count:tax
+    jsr copy_characters_within_line
+
+    \ erase_characters_within_line(from = erase_from, to = 80, attributes =
+    \ last char on line attributes)
+    pla:tax
+    ldy #80
+    pla
+    jsr erase_characters_within_line
+
+    jmp page_in_main_ram
+}
+
+
+\ Get the start address in video RAM of the character at physical S0B
+\ co-ordinates (Y, A) (S0B), placing it at (zero page address) X and X+1. Y
+\ must be in [0, 80] and A must be in [0, 32]. (Y=80 addresses the character
+\ at the start of the next line, effectively.)
+\
+\ If the screen has been hardware scrolled, the returned address may be greater
+\ than &8000.
+\
+\ The register assignment is somewhat counter-intuitive to make the
+\ implementation nicer (for example, there's a "zp,x" addressing mode but not
+\ a "zp,y" addressing mode).
+\
+\ On entry:
+\   Y is X co-ordinate (S0B) of character
+\   A is Y co-ordinate (S0B) of character
+\   X/X+1 are zero page addresses to use for result storage
+\
+\ On exit:
+\   X and Y are preserved
+\   X and X+1 contain character start address
+\   A contains value at X+1 and the flags reflect this value
+\   rest of oswrch_zp is preserved
+.get_video_ram_character_address_physical_x_unwrapped
+{
+    sty &01,x \ save Y
+.^get_video_ram_character_address_physical_x_unwrapped_internal
+    tay
+    \ Set &00+X to screen_top_line_address+A*640, i.e. the address of the
+    \ start of the line.
+    lda mult_640_table_low,y:clc:adc screen_top_line_address:sta &00,x
+    lda mult_640_table_high,y:adc screen_top_line_address+1
+    ldy &01,x \ restore Y
+    sta &01,x \ before we save this over the top of the saved Y
+
+    \ Add Y*8 to &00+X. To avoid needing any extra workspace, we
+    \ derive the low byte (by shifting Y left three times), add that, then
+    \ we derive the high byte (by shifting Y right five times) and add
+    \ that. If I didn't get my byte and cycle counting wrong, this is two
+    \ bytes shorter than using an extra zp location as workspace and only
+    \ one cycle slower. Avoiding the need for extra workspace is the real
+    \ driver for this though.
+    tya:asl a:asl a:asl a
+    clc:adc &00,x:sta &00,x
+    php \ save the carry ready for the next addition
+    tya:lsr a:lsr a:lsr a:lsr a:lsr a
+    plp \ restore the carry
+    adc &01,x:sta &01,x
+    rts
+}
+
+\ As get_video_ram_character_address_current_line_wrapped but using co-ordinates
+\ (0, vt102_logical_cursor_y) and returning the address in T.
+.*get_video_ram_current_line_start_address_in_t_wrapped
+    ldy #0:ldx #oswrch_t
+    fall_through_to get_video_ram_character_address_current_line_wrapped
+
+\ Get the start address in video RAM of the character at logical S0B
+\ co-ordinates (Y, vt102_logical_cursor_y), placing it at (zero page address) X
+\ and X+1. Y must be in [0, 80]. The returned address is wrapped so it will lie
+\ within video RAM even if the screen has been hardware scrolled.
+.*get_video_ram_character_address_current_line_wrapped
+{
+    xassert_oswrch_ww_valid
+    sty &00,x
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y
+    ldy &00,x
+    fall_through_to get_video_ram_character_address_logical_x_wrapped
+}
+
+\ As get_video_ram_character_address_physical_x_unwrapped except that:
+\ - on entry Y contains a *logical* X co-ordinate not a *physical* X co-ordinate
+\ - the address returned at X/X+1 is wrapped to lie within the video RAM
+.*get_video_ram_character_address_logical_x_wrapped
+{
+    xassert_oswrch_ww_valid
+    sty &01,x
+    pha
+    tay:lda (oswrch_ww),y:beq not_double_width
+    asl &01,x
+.not_double_width
+    pla
+    jsr get_video_ram_character_address_physical_x_unwrapped_internal
+    \ lda &01,x - redundant
+    bpl get_video_ram_character_address_logical_x_wrapped_rts
+    sec:sbc screen_size_high_byte:sta &01,x
+.^get_video_ram_character_address_logical_x_wrapped_rts
+    rts
+}
+
+
+{
+\ Make the video RAM available at &3000-&7fff, whether that's normal RAM
+\ or shadow RAM.
+.*page_in_video_ram
+    xassert_oswrch_ww_valid
+    ldy #host_flags_offset:lda (oswrch_ww),y
+    assert host_flag_shadow_mode == 1<<7
+    bpl get_video_ram_character_address_logical_x_wrapped_rts
+    lda #1
+    xbne_always vram_select
+
+\ Make the main RAM available at &3000-&7fff.
+.*page_in_main_ram
+    xassert_oswrch_ww_valid
+    ldy #host_flags_offset:lda (oswrch_ww),y
+    assert host_flag_shadow_mode == 1<<7
+    bpl get_video_ram_character_address_logical_x_wrapped_rts
+    lda #0
+    fall_through_to vram_select
+
+\ *Given we're in a shadow mode*, select the RAM which is paged in at
+\ &3000-&7fff depending on A:
+\     A=0 selects main RAM
+\     A=1 selects shadow RAM
+\ (This subroutine taken from http://beebwiki.mdfs.net/Paging_in_video_memory)
+.vram_select
+    pha:tax			\ A=0 main RAM, A=1 video RAM
+    lda #108:jsr osbyte		\ attempt to select Master/Integra-B video RAM
+                                \ X<>255 => selected OK
+    pla:inx:bne get_video_ram_character_address_logical_x_wrapped_rts
+    eor #1:tax			\ A=1 main RAM, A=0 video RAM
+    lda #111:jmp osbyte		\ attempt to select Aries/Watford video RAM
+}
+
+
+\ Copy up to max_screen_lines (32) lines starting at line X to line Y (S0B co-ordinates; the
+\ 'within_margins' part of the name just refers to the bounds checking). X and
+\ Y must be >= top_margin; bounds checking is performed against the bottom
+\ margin automatically, which is why it's OK to copy *up to* max_screen_lines
+\ lines.
+{
+.*copy_lines_within_margins
+    \ clamp_x_and_y_to_bottom_margin_plus_1 uses TL
+    \ get_stored_screen_line_a_start_to_zp_x_unwrapped uses only the return register
+    \ get_video_ram_character_address_physical_x_unwrapped uses only the return register
+    count = oswrch_vl
+    bottom_margin_plus_1 = oswrch_vh
+    from = oswrch_ul
+    to = oswrch_uh
+
+    jsr clamp_x_and_y_to_bottom_margin_plus_1
+    sta bottom_margin_plus_1:stx from:sty to
+    txa:pha:tya:pha
+    txa:pha:tya:pha         \ stack: (top) to from to from
+
+    \ Set A=min(bottom_margin + 1 - from, bottom_margin + 1 - to)
+    lda bottom_margin_plus_1
+    jsr min_a_minus_x_a_minus_y
+    \ Set A=min(A, max_screen_lines)
+    cmp #max_screen_lines:bcc a_lt_max_screen_lines
+    lda #max_screen_lines
+.a_lt_max_screen_lines
+    sta count
+
+    \ Copy line attributes - modifies 'to' and 'from', but not 'count'
+    tax
+    bne count_not_zero
+    pla:pla:pla:pla
+    rts
+.count_not_zero
+    lda from:cmp to:bcc from_lt_to
+    xassert_oswrch_ww_valid
+.from_ge_to_loop
+    ldy from:lda (oswrch_ww),y
+    ldy to:sta (oswrch_ww),y
+    inc from:inc to
+    dex:bne from_ge_to_loop
+    xbeq_always line_attributes_done
+.from_lt_to
+    dex
+    txa:clc:adc from:sta from
+    txa:clc:adc to:sta to
+.from_lt_to_loop
+    ldy from:lda (oswrch_ww),y
+    ldy to:sta (oswrch_ww),y
+    dec from:dec to
+    dex:bpl from_lt_to_loop
+.line_attributes_done
+
+    \ Copy within the stored screen; we don't check
+    \ user_options_no_stored_screen immediately as we want to avoid having
+    \ to adjust the stack contents. The extra unnecessary work is relatively
+    \ negligible in the context of this routine.
+			    \ stack: (top) to from to from
+    pla:ldx #oswrch_u:jsr get_stored_screen_line_a_start_to_zp_x_unwrapped
+    pla:ldx #oswrch_t:jsr get_stored_screen_line_a_start_to_zp_x_unwrapped
+    lda count:pha           \ stack: (top) count to from
+    xassert_oswrch_ww_valid
+    ldy #user_options_offset:lda (oswrch_ww),y
+    assert user_option_stored_screen == 1<<7
+    bpl no_stored_screen
+    ldy count
+    jsr init_oswrch_v_for_stored_screen_memmove \ preserves Y, corrupts count
+    \ Set YX=120*count, i.e. the number of bytes to move
+    lda mult_120_table_low,y:tax:lda mult_120_table_high,y:tay
+    jsr memmove
+.no_stored_screen
+
+    \ Copy within the video RAM
+                            \ stack: (top) count to from
+    pla:sta count           \ stack: (top) to from
+    pla:ldx #oswrch_u:ldy #0:jsr get_video_ram_character_address_physical_x_unwrapped
+    pla:ldx #oswrch_t:ldy #0:jsr get_video_ram_character_address_physical_x_unwrapped
+    ldy count
+    \ Set YX=640*count, i.e. the number of bytes to move
+    lda mult_640_table_low,y:tax:lda mult_640_table_high,y:tay
+.^memmove_video_ram
+    lda screen_memory_start_high_byte:sta oswrch_vl
+    lda #&80:sta oswrch_vh
+    jsr memmove
+    jmp init_oswrch_ww_vectors_claimed \ we corrupted this
+}
+
+
+\ Set up VL and VH to point to the bottom and top of the stored screen, ready
+\ for use with memmove. The caller is responsible for ensuring that we do
+\ actually have a stored screen, otherwise the resulting values will be
+\ meaningless.
+\
+\ Preserves: Y
+.init_oswrch_v_for_stored_screen_memmove
+{
+    xassert_oswrch_ww_valid
+    ldx oswrch_ww+1:inx:stx oswrch_vl
+    txa:clc:adc #hi(stored_screen_size):sta oswrch_vh
+    rts
+}
+
+
+\ Erase lines (S0B co-ordinates; the name 'within_margins' just refers to the
+\ bounds clamping performed) from X (inclusive) to Y (exclusive). Both X and Y
+\ must be >= top_margin; they will be clamped to the bottom margin. Both the
+\ stored screen and the video RAM are modified.
+.*erase_lines_within_margins
+{
+    xassert_oswrch_ww_valid
+    jsr clamp_x_and_y_to_bottom_margin_plus_1
+    sec
+    fall_through_to erase_lines_within_screen
+}
+
+\ Erase screen lines (S0B co-ordinates) X (inclusive) to Y (exclusive).
+\
+\ No bounds checking is performed; X and Y must both lie in [0, 32] and it
+\ must be the case that X<=Y. This is a no-op if X==Y.
+\
+\ If C is clear, only the stored screen will be modified; otherwise both
+\ the stored screen and the video RAM are modified.
+\
+\ If entered via erase_lines_within_screen_accepting_v, V clear means the
+\ stored screen modification will affect the line attributes, V set will leave
+\ the line attributes alone. Entering at erase_lines_within_screen clears V;
+\ this is the normal case.
+\
+\ Preserves: W
+.*erase_lines_within_screen
+{
+    to = oswrch_vl
+
+    clv
+.*erase_lines_within_screen_accepting_v
+    php
+
+    \ Eliminate the no-op case immediately. As it happens to be free we
+    \ detect the invalid case X>Y and turn that into a no-op too.
+    sty to
+    cpx to:bcc from_lt_to
+    plp
+    rts
+.from_lt_to
+
+    xassert_oswrch_ww_valid
+
+    \ Erase the line attributes in the stored screen, provided V is clear.
+    tya:pha             \ stack: (top) to flags
+    txa:pha             \ stack: (top) from to flags
+    bvs dont_erase_line_attributes
+    tay
+    lda #0
+.line_attribute_loop
+    sta (oswrch_ww),y
+    iny
+    cpy to:bcc line_attribute_loop
+.dont_erase_line_attributes
+
+    \ Erase the characters/character attributes in the stored screen
+    ldy #user_options_offset:lda (oswrch_ww),y
+    assert user_option_stored_screen == 1<<7
+    bpl no_stored_screen
+    txa:ldx #oswrch_t:jsr get_stored_screen_line_a_start_to_zp_x_unwrapped
+    lda to:ldx #oswrch_u:jsr get_stored_screen_line_a_start_to_zp_x_unwrapped
+    jsr init_oswrch_v_for_stored_screen_memmove
+    \ By clearing the stored screen to all-' ' bytes, we are assuming that this
+    \ is a semi-sane value for the attribute bytes. Fortunately this encodes one
+    \ character bold and one character with no attributes and these both look
+    \ identical for a space. There's no way to change the character at a
+    \ location without changing its attributes, so this doesn't cause any
+    \ problems when the character is overwritten. (Reverse or underline *would*
+    \ be visible on a space, so if anything caused the screen to be redrawn all
+    \ the spaces created here would suddenly become reversed/underlined if ' '
+    \ encoded either reverse or underline attributes..)
+    assert ' ' == character_attribute_bold << 4
+    lda #' '
+    jsr memset
+.no_stored_screen
+
+    \ Erase the video RAM
+                        \ stack: (top) from to flags
+    pla:ldx #oswrch_t:ldy #0:jsr get_video_ram_character_address_physical_x_unwrapped
+    pla:ldx #oswrch_u:ldy #0:jsr get_video_ram_character_address_physical_x_unwrapped
+
+    \ If we're not to touch the video RAM, stop now - we didn't check before
+    \ as the stack had other stuff on it, which is slightly inefficient but
+    \ we avoid the actual memset call, which is the real saving.
+                        \ stack: (top) flags
+    plp:bcc get_current_line_len_rts
+
+    lda #0
+.^memset_video_ram
+    ldx screen_memory_start_high_byte:stx oswrch_vl
+    ldx #&80:stx oswrch_vh
+    jmp memset
+}
+
+
+\ Return with A=current line length (i.e. 40 for a double-width line, 80 for a
+\ single-width line).
+\
+\ Preserves: X
+.*get_current_line_len
+{
+    jsr get_current_line_attributes:beq not_double_width
+    lda #40
+    rts
+.not_double_width
+    lda #80
+.^get_current_line_len_rts
+    rts
+}
+
+
+\ Set A=bottom_margin+1, X=min(X, bottom_margin+1), Y=min(Y, bottom_margin+1);
+\ +1 is used because bottom_margin is inclusive and we want to allow X and
+\ Y to point to one line past, just as we allow line number 32 on a 0-based
+\ 32-line to screen in some contexts.
+\
+\ Corrupts: TL
+.clamp_x_and_y_to_bottom_margin_plus_1
+{
+    xassert_oswrch_ww_valid
+    sty oswrch_tl
+    ldy #bottom_margin_offset:lda (oswrch_ww),y:clc:adc #1
+    ldy oswrch_tl 
+    fall_through_to clamp_x_and_y_to_a
+}
+
+
+\ Set X=min(X, A), Y=min(Y, A)
+\
+\ Preserves: A
+\ Corrupts: TL
+.*clamp_x_and_y_to_a
+{
+    sta oswrch_tl
+    cpx oswrch_tl:bcc x_in_bounds
+    tax
+.x_in_bounds
+    cpy oswrch_tl:bcc y_in_bounds
+    tay
+.y_in_bounds
+    rts
+}
+
+
+\ Set A=min(A-X, A-Y); the flags on exit reflect the new value of A.
+\
+\ Preserves: X, Y
+\ Corrupts: TL
+.min_a_minus_x_a_minus_y
+{
+    sty oswrch_tl
+    cpx oswrch_tl:bcc x_lt_y
+    \ X >= Y
+    stx oswrch_tl
+.x_lt_y
+    \ oswrch_tl == max(X, Y), so min(A-X, A-Y) == A-oswrch_tl
+    sec:sbc oswrch_tl
+    rts
+}
+
+
+\ If the current line is double-width, double X and Y to convert them from
+\ logical X co-ordinates to physical X co-ordinates. Finally set A=80,
+\ X=min(X, 80) and Y=min(Y, 80).
+\
+\ Corrupts: TL
+.x_y_logical_to_physical_and_clamp
+{
+    sty oswrch_tl
+    jsr get_current_line_attributes:php
+    ldy oswrch_tl
+    plp:beq not_double_width
+    txa:asl a:tax
+    tya:asl a:tay
+.not_double_width
+    lda #80:xbne_always clamp_x_and_y_to_a
+}
+
+
+\ Copy up to 80 characters from logical cursor position X within the
+\ current line to logical cursor position Y, operating on both the stored
+\ screen and the video RAM. X may be greater or less than Y. This works for
+\ single and double width lines. Bounds checking is performed so X/Y may
+\ index off the right hand edge of the line safely; similarly if X+80 or
+\ Y+80 indexes off the right hand edge of the line this is harmless.
+\
+\ Preserves: W
+.copy_characters_within_line
+{
+    \ get_current_line_len uses no oswrch registers
+    \ clamp_x_and_y_to_a and min_a_minus_x_a_minus_y use TL
+    \ get_stored_character and set_stored_character use UL and T
+    \ get_video_ram_character_address_physical_x_unwrapped uses only the oswrch register it
+    \ populates
+    from = oswrch_uh
+    to = oswrch_vl
+    count = oswrch_vh
+
+    txa:pha:tya:pha
+
+    \ Do the copy within the stored screen
+
+    sty to
+
+    xassert_oswrch_ww_valid
+    ldy #user_options_offset:lda (oswrch_ww),y
+    assert user_option_stored_screen == 1<<7
+    bpl no_stored_screen
+
+    jsr get_current_line_len
+    ldy to 
+    jsr clamp_x_and_y_to_a
+    stx from:sty to
+    jsr min_a_minus_x_a_minus_y:sta count \ may be 0
+    beq stored_screen_done
+
+    \ TODO: This is quite slow. In practice it doesn't seem all that
+    \ performance critical, although some applications might use this more than
+    \ others. It would be possible to get much cleverer, copying bytes at a
+    \ time, but it gets a bit tricky with different special cases because of the
+    \ way two characters are packed into three bytes in the stored screen.
+    cpx to:bcc from_lt_to
+    \ from >= to
+.from_ge_to_loop
+    ldy from:jsr get_stored_character
+    ldy to:jsr set_stored_character
+    inc from:inc to:dec count:bne from_ge_to_loop
+    xbeq_always stored_screen_done
+
+.from_lt_to
+    dec count
+    txa:clc:adc count:sta from
+    tya:clc:adc count:sta to
+.from_lt_to_loop
+    ldy from:jsr get_stored_character
+    ldy to:jsr set_stored_character
+    dec from:dec to:dec count:bpl from_lt_to_loop
+
+.no_stored_screen
+.stored_screen_done
+
+    \ Do the copy within the video RAM
+
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:sta oswrch_vl
+
+    pla:tay:pla:tax
+    jsr x_y_logical_to_physical_and_clamp \ also sets A=80
+    jsr min_a_minus_x_a_minus_y \ A=count (in physical characters)
+    pha
+
+    stx oswrch_vh
+
+    lda oswrch_vl
+    ldx #oswrch_u:jsr get_video_ram_character_address_physical_x_unwrapped  
+
+    lda oswrch_vl
+    ldy oswrch_vh
+    ldx #oswrch_t
+    jsr get_video_ram_character_address_physical_x_unwrapped    
+
+    \ YX=count (in physical characters)*8, the number of bytes to move
+    lda #0:sta oswrch_wh
+    pla
+    asl a \ A was in [0,80] before, so this can't shift a 1 into C
+    asl a:rol oswrch_wh
+    asl a:rol oswrch_wh
+    tax:ldy oswrch_wh
+
+    jmp memmove_video_ram
+}
+
+
+\ Erase characters from logical X co-ordinate X (inclusive) to Y (exclusive)
+\ in the current line, replacing them with spaces which have the character
+\ attributes in A. X and Y are clamped to the actual line length so this is
+\ safe to call with overly-large values. Double-width lines are supported.
+.*erase_characters_within_line
+{
+    \ clamp_x_and_y_to_a uses TL
+    \ set_stored_character uses T and UL
+    character_attributes = oswrch_uh
+    from = oswrch_vl
+    to = oswrch_vh
+
+    pha:sta character_attributes
+    txa:pha:tya:pha
+
+    \ Erase in the stored screen
+
+    lda #stored_line_len_chars:jsr clamp_x_and_y_to_a
+    stx from:sty to
+    cpx to:beq stored_screen_done
+
+    xassert_oswrch_ww_valid
+    ldy #user_options_offset:lda (oswrch_ww),y
+    assert user_option_stored_screen == 1<<7
+    bpl no_stored_screen
+
+    \ TODO: This is quite slow, but in practice it doesn't seem all that
+    \ performance-critical, although some applications might use this more than
+    \ others. It would be possible to get much cleverer, copying bytes at a
+    \ time, but it gets a bit tricky with different special cases because of the
+    \ way two characters are packed into three bytes in the stored screen.
+    ldx character_attributes
+    ldy from
+.stored_screen_loop
+    lda #' '
+    jsr set_stored_character
+    inc from
+    ldy from:cpy to:bcc stored_screen_loop
+.stored_screen_done
+.no_stored_screen
+
+    \ Erase in video RAM
+
+    pla:tay:pla:tax
+    jsr x_y_logical_to_physical_and_clamp
+    stx from:sty to
+
+    xassert_oswrch_ww_valid
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y:pha
+    ldy from
+    ldx #oswrch_t:jsr get_video_ram_character_address_physical_x_unwrapped
+
+    pla \ get vt102_cursor_y
+    ldy to
+    ldx #oswrch_u:jsr get_video_ram_character_address_physical_x_unwrapped
+
+    \ Save the contents of oswrch_t and oswrch_u; we might want them again to
+    \ handle the underline case below. (memset_video_ram will corrupt them.)
+    assert oswrch_t + 2 == oswrch_u
+    ldx #3
+.push_loop
+    lda oswrch_t,x:pha
+    dex:bpl push_loop
+
+    \ Clear the video RAM; we clear it to 0 or 255 depending on whether or not
+    \ the reverse video attribute is set.
+    tsx:lda stack+5,x \ peek character attributes
+    and #character_attribute_reverse
+    beq not_reverse:lda #255:.not_reverse
+    jsr memset_video_ram
+
+    \ If the space created contains underlined characters, we need to draw in
+    \ the underline. We do this with EOR so that it works whether the space is
+    \ reverse video or not.
+
+    \ We restore the contents of oswrch_t and oswrch_u even if they're not
+    \ needed; we have to remove these bytes from the stack anyway.
+    ldx #0
+.pull_loop
+    pla:sta oswrch_t,x
+    inx:cpx #4:bne pull_loop
+    
+    pla \ get character attributes
+    assert character_attribute_underline == 1<<0
+    lsr a:bcc not_underline
+
+    ldy #7
+.underline_loop
+    lda oswrch_tl:sta oswrch_vl:cmp oswrch_ul:bne not_equal
+    lda oswrch_th:cmp oswrch_uh:beq underline_done
+.not_equal
+    \ We need to keep T unwrapped so it can be compared with U, but we need to
+    \ wrap it for access to the screen memory. (This is slightly more compact
+    \ that wrapping both T and U.)
+    lda oswrch_th
+    { bpl not_wrapped:sec:sbc screen_size_high_byte:.not_wrapped }
+    sta oswrch_vh
+    lda (oswrch_v),y:eor #255:sta (oswrch_v),y
+    lda oswrch_tl:clc:adc #8:sta oswrch_tl
+    bcc underline_loop
+    inc oswrch_th
+    xbcs_always underline_loop
+
+.underline_done
+.not_underline
+    rts
+}
+
+
+\ Read the character at logical cursor position (Y, vt102_cursor_y) in the
+\ stored screen, returning the character in A and its attributes in X.
+\ oswrch_ww must be initialised on entry and there must actually be a stored
+\ screen.
+\
+\ Corrupts: Y, T
+\ Preserves: U, V, W
+.*get_stored_character
+{
+    xassert_stored_screen_enabled
+    jsr stored_screen_character_address_to_reg_t_wrapped
+    ldy #2
+    lda (oswrch_t),y
+    bcs odd_x_coordinate
+.even_x_coordinate
+    lsr a:lsr a:lsr a:lsr a
+    ldy #0
+.common
+    tax
+    lda (oswrch_t),y
+    rts
+.odd_x_coordinate
+    and #%00001111
+    dey \ Y=1
+    xbne_always common
+}
+
+
+\ Write the character in A with attributes in X to the stored screen at
+\ logical cursor position (Y, vt102_cursor_y). oswrch_ww must be
+\ initialised on entry and there must actually be a stored screen.
+\
+\ Preserves: X, UH, V, W
+\ Corrupts: A, Y, T, UL
+.*set_stored_character
+{
+    xassert_stored_screen_enabled
+    pha
+    jsr stored_screen_character_address_to_reg_t_wrapped
+    ldy #2
+    lda (oswrch_t),y
+    bcs odd_x_coordinate
+
+.even_x_coordinate
+    and #%00001111
+    ora left_shift_4_table,x
+    sta (oswrch_t),y
+    ldy #0
+    xbeq_always common_end
+
+.odd_x_coordinate
+    and #%11110000
+    ora identity_table,x \ trick to allow 'ora x' faster than 'stx zp:ora zp'
+    sta (oswrch_t),y
+    dey \ Y=1
+.common_end
+    pla
+    sta (oswrch_t),y
+    rts
+}
+
+
+\ Set oswrch_t to hold the address of the three-byte grouping in the stored
+\ screen which holds co-ordinate (Y, vt102_cursor_y). Y must be in [0,
+\ 79]. oswrch_ww must be initialised on entry, and there must be a stored
+\ screen. On exit C=(Y % 2).
+\
+\ Corrupts: A, Y, T
+\ Preserves: X, U, V, W
+.*stored_screen_character_address_to_reg_t_wrapped
+    xassert_stored_screen_enabled
+
+    \ Set A = (Y/2)*3
+    tya
+    lsr a:php	    \ A = Y/2, C = Y%2
+    sta oswrch_tl
+    asl a           \ C = 0, A = (Y/2)*2
+    adc oswrch_tl   \ A = (Y/2) + (Y/2)*2 = (Y/2)*3, C = 0
+
+    \ Set T = stored_screen_start + (Y/2)*3, so T points to the correct
+    \ character grouping within the first line of the stored screen.
+    sta oswrch_tl
+    xassert_oswrch_ww_valid
+    lda oswrch_ww+1:xclc:adc #hi(stored_screen_offset):sta oswrch_th
+    \ C is clear, as there can't be a carry from the high byte of the address.
+
+    \ Adjust T to point within line vt102_cursor_y, taking account of the fact
+    \ that line 0 is actually stored at stored_screen_start_line within the
+    \ stored screen.
+    ldy #vt102_cursor_y_offset:lda (oswrch_ww),y
+    ldy #stored_screen_start_line_offset:xclc:adc (oswrch_ww),y
+    \ C is clear, as maximum addition just performed was 31+31.
+    assert (max_screen_lines and (max_screen_lines - 1)) == 0
+    and #(max_screen_lines - 1)
+    tay
+    lda mult_120_table_low,y:xclc:adc oswrch_tl:sta oswrch_tl
+    lda mult_120_table_high,y:adc oswrch_th:sta oswrch_th
+
+    plp             \ C = Y%2
+    rts
+
+\ Set the zp register identified by X to the address of the start of line A
+\ (S0B) in the stored screen; the address returned is not wrapped so it may
+\ lie past the end of the stored screen.
+\
+\ Corrupts: A, Y
+\ Preserves: X
+.get_stored_screen_line_a_start_to_zp_x_unwrapped
+    tay
+    lda mult_120_table_low,y:sta &00,x
+    lda mult_120_table_high,y:sta &01,x
+    xassert_oswrch_ww_valid
+    ldy #stored_screen_start_line_offset:lda (oswrch_ww),y
+    tay
+    lda mult_120_table_low,y:clc:adc &00,x:sta &00,x
+    lda mult_120_table_high,y:adc &01,x
+    \ C is clear, as the maximum result is (32+31)*120, which fits in 2 bytes.
+    xclc:adc oswrch_ww+1:adc #hi(stored_screen_offset):sta &01,x
+    rts
+
+
+\ 120-times multiplication table; note that we need the Y=32 (max_screen_lines)
+\ case as we use it to generate the (exclusive) end address for erase
+\ operations which fully include the last line on the screen.
+.mult_120_table_low
+for y, 0, max_screen_lines
+    equb lo(120 * y)
+next
+\ See make-table.py for mult_120_table_high
+
+\ 640-times multiplication table; note that we need the Y=32 (max_screen_lines)
+\ case as we use it to generate the (exclusive) end address for erase
+\ operations which fully include the last line on the screen.
+\
+\ TODO: It would probably be possible to save a few bytes at the cost of a
+\ little bit of performance by removing mult_640_table_low; note that it just
+\ alternates between &00 and &80 so something like 'and #1:beq skip:lda
+\ #&80:.skip' will calculate it.
+.*mult_640_table_low
+for y, 0, max_screen_lines
+    equb lo(640 * y)
+next
+.*mult_640_table_high
+for y, 0, max_screen_lines
+    equb hi(640 * y)
+next
+
+} \ close file scope

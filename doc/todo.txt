@@ -1,0 +1,77 @@
+It might well be possible to support shadow RAM on the BBC B+; I envisage this
+working roughly as follows:
+- when we claim vectors on a BBC B+, copy ourselves into the 12K RAM bank; the
+  code do to this can be located at &Bxxx so it isn't eclipsed by the 12K RAM
+  bank when that's paged in. (It might be good to have a PRIVATE/NOPRIVATE flag
+  on *VT102/52 which allows the user to say "leave my 12K private RAM bank 
+  alone, don't support shadow modes".)
+- ensure all code which needs to access the video ram lives in the 4K at &Axxx
+  (probably by using macros to replace the relevant instructions; the macros
+  can then assert that they are assembling at &Axxx)
+- on a B+, we can then page in shadow RAM by setting b7 of ROMSEL and page in
+  main RAM by clearing b7 of ROMSEL.
+- vectors would still be claimed to point to the sideways ROM bank as normal
+
+
+
+We could potentially do a special B+-only build which runs entirely from the
+12K RAM bank without using any sideways RAM; it would probably claim the *LINE
+command to accept its arguments. It wouldn't be able to claim any main RAM
+workspace but we could have a small workspace within the 12K RAM bank. This
+would definitely be a conditional compilation job, as this version *isn't* a
+sideways ROM. Note that if (as I think is the case) code at &Axxx *always* sees
+the shadow RAM, such a version would possibly be shadow RAM *only* or (if we
+arranged the video code to lie outside &Axxx) main RAM *only* - unlike the
+ROM-based version which can choose between running video code at &Axxx in the
+sideways bank (sees main RAM) or the private RAM bank (sees shadow RAM). Maybe
+there'd be enough room for two copies of the video RAM accessing code so we
+could support both in the same build, although that might be a nightmare to
+assemble. Given the intended second processor use, it might not be a big deal
+for such a build to simply force *SHADOW on so we always use shadow modes.
+
+
+
+Could we support true smooth scrolling?
+
+
+
+Possibly it would be nice to provide some means for the user to specify the
+default options when the emulation is turned on with no arguments. One
+possibility would be to provide a little BASIC program to patch the ROM image.
+We could have a patch table at the end of the ROM (it could even live inside
+the sideways RAM workspace, since the intended use would be to run it on the
+original image on disc), something like a series of (what, where) pairs, which
+initially would probably just be (0,
+address-of-default-argument-byte-probably-operand-of-an-LDA#) and the BASIC
+program could recognise that to allow it to patch any version of the ROM,
+rather than being tied to a specific version. We could have a trivial checksum
+on the table to minimise problems. In some ways far more fancy than is
+necessary of course.
+
+
+
+memmove and memset could probably be speeded up by dynamically generating
+absolute load/store code for the inner loops, avoiding the need to use
+post-indexed indirect addressing; we probably have enough spare space in the
+first page of our workspace for an inner loop.
+
+
+Offer a shorthand way of turning the emulation on with given options by
+specifying an 8-bit number corresponding to user_options (and have *STEM STATUS
+show the current options in this format)
+
+
+
+A reference manual describing things like:
+- the various options to *VT102/*VT52
+- the character set support
+- the keyboard handling
+- VT102/52 features supported/not supported
+- large/small workspace
+
+
+Add support for resetting the terminal from the command line, e.g. via *VT102
+RESET? But you can already do *VT102 OFF then *VT102.
+
+
+vi: tw=79
